@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { PermissionStatus, OnboardingPermissions } from '@/types/onboarding';
 import { resolveOnboardingSummaryModelStatus } from '@/lib/onboarding-summary-model';
+import { activateGeminiLive } from '@/lib/gemini-live';
 import type { ParakeetDownloadProgressEvent } from '@/lib/parakeet';
 
 const PARAKEET_MODEL = 'parakeet-tdt-0.6b-v3-int8';
@@ -62,6 +63,9 @@ interface OnboardingContextType {
   setPermissionStatus: (permission: keyof OnboardingPermissions, status: PermissionStatus) => void;
   setPermissionsSkipped: (skipped: boolean) => void;
   completeOnboarding: () => Promise<void>;
+  // Fork addition: Gemini cloud transcription chosen instead of local models
+  cloudTranscription: boolean;
+  setCloudTranscription: (value: boolean) => void;
   startBackgroundDownloads: (options: StartBackgroundDownloadsOptions) => Promise<void>;
   retryParakeetDownload: () => Promise<void>;
 }
@@ -77,6 +81,7 @@ const OnboardingContext = createContext<OnboardingContextType | undefined>(undef
 export function OnboardingProvider({ children }: { children: React.ReactNode }) {
   const [currentStep, setCurrentStep] = useState(1);
   const [completed, setCompleted] = useState(false);
+  const [cloudTranscription, setCloudTranscription] = useState(false);
   const [parakeetDownloaded, setParakeetDownloaded] = useState(false);
   const [parakeetProgress, setParakeetProgress] = useState(0);
   const [parakeetProgressInfo, setParakeetProgressInfo] = useState<ParakeetProgressInfo>({
@@ -490,7 +495,7 @@ export function OnboardingProvider({ children }: { children: React.ReactNode }) 
         refresh: true,
       });
       setSummaryModelDownloaded(selectedModelReady);
-      if (!selectedModelReady) {
+      if (!selectedModelReady && !cloudTranscription) {
         requestSummaryModelDownload(modelToSave);
       }
 
@@ -498,6 +503,10 @@ export function OnboardingProvider({ children }: { children: React.ReactNode }) 
       await invoke('complete_onboarding', {
         model: modelToSave,
       });
+      if (cloudTranscription) {
+        // complete_onboarding selects Parakeet; switch to Gemini Live instead.
+        await activateGeminiLive();
+      }
       setCompleted(true);
       console.log('[OnboardingContext] Onboarding completed with model:', modelToSave);
 
@@ -634,6 +643,8 @@ export function OnboardingProvider({ children }: { children: React.ReactNode }) 
         setPermissionStatus,
         setPermissionsSkipped,
         completeOnboarding,
+        cloudTranscription,
+        setCloudTranscription,
         startBackgroundDownloads,
         retryParakeetDownload,
       }}

@@ -9,6 +9,7 @@ import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'framer-motion';
 import { getSummaryModelSizeLabel, getSummaryModelSizeMb } from '@/lib/onboarding-summary-model';
 import type { ParakeetDownloadProgressEvent } from '@/lib/parakeet';
+import { GeminiCloudSetup } from '../GeminiCloudSetup';
 
 const PARAKEET_MODEL = 'parakeet-tdt-0.6b-v3-int8';
 
@@ -34,6 +35,7 @@ export function DownloadProgressStep() {
     setSummaryModelDownloaded,
     startBackgroundDownloads,
     completeOnboarding,
+    cloudTranscription,
   } = useOnboarding();
 
   const [isMac, setIsMac] = useState(false);
@@ -339,7 +341,7 @@ export function DownloadProgressStep() {
 
   const handleContinue = async () => {
     // Verify actual model availability (catches state drift)
-    try {
+    if (!cloudTranscription) try {
       await invoke('parakeet_init');
       const actuallyAvailable = await invoke<boolean>('parakeet_has_available_models');
 
@@ -369,7 +371,7 @@ export function DownloadProgressStep() {
       summaryState.status === 'completed';
 
     // Show toast if downloads still in progress
-    if (!downloadsComplete) {
+    if (!downloadsComplete && !cloudTranscription) {
       toast.info('Downloads will continue in the background', {
         description: 'You can start using the app. Recording will be available once speech recognition is ready.',
         duration: 5000,
@@ -497,7 +499,7 @@ export function DownloadProgressStep() {
     >
       <div className="flex flex-col items-center space-y-6">
         {/* Download Cards */}
-        <div className="w-full max-w-lg space-y-4">
+        {!cloudTranscription && <div className="w-full max-w-lg space-y-4">
           {renderDownloadCard(
             'Transcription Engine',
             <Mic className="w-5 h-5 text-gray-600" />,
@@ -512,7 +514,9 @@ export function DownloadProgressStep() {
             getSummaryModelSizeLabel(selectedSummaryModel || recommendedSummaryModel),
             'MiB'
           )}
-        </div>
+        </div>}
+
+        <GeminiCloudSetup />
 
         {/* Info Message - Only show when Parakeet is downloaded */}
         <AnimatePresence>
@@ -541,10 +545,10 @@ export function DownloadProgressStep() {
         <div className="w-full max-w-xs">
           <Button
             onClick={handleContinue}
-            disabled={!parakeetDownloaded || isCompleting}
+            disabled={(!parakeetDownloaded && !cloudTranscription) || isCompleting}
             className="w-full h-11 bg-gray-900 hover:bg-gray-800 text-white disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {(isCompleting || !parakeetDownloaded) ? (
+            {(isCompleting || (!parakeetDownloaded && !cloudTranscription)) ? (
               <Loader2 className="w-4 h-4 mr-2 animate-spin" />
             ) : (
               'Continue'
