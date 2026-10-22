@@ -13,7 +13,7 @@ import {
   type ModelWithStatus,
 } from '@/lib/transcription-model-readiness';
 import { toast } from 'sonner';
-import { GEMINI_LIVE_PROVIDER, getGeminiLiveFallbackProvider } from '@/lib/gemini-live';
+import { CLOUD_ONLY, GEMINI_LIVE_PROVIDER, getGeminiLiveFallbackProvider } from '@/lib/gemini-live';
 
 const TRANSCRIPTION_RUNTIME_START_ERROR_CODE = 'TRANSCRIPTION_RUNTIME_INITIALIZATION_FAILED';
 const TRANSCRIPTION_RUNTIME_USER_MESSAGE = 'Speech recognition could not initialize. Restart Meetily. If the problem continues, repair or reinstall the app.';
@@ -85,6 +85,8 @@ export function useRecordingStart(
   const checkTranscriptionModelReady = useCallback(async (): Promise<boolean> => {
     try {
       const provider = await getTranscriptionProvider();
+      // Gemini Live in cloud-only mode has no local model; Rust validates the API keys.
+      if (provider === CLOUD_ONLY) return true;
       const commands = getProviderCommands(provider);
 
       if (commands) {

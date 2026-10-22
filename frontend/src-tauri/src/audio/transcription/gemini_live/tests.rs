@@ -8,19 +8,20 @@
 //   GEMINI_API_KEY=... MEETILY_GEMINI_TEST_PCM=clip_16k_s16le.pcm \
 //     cargo test --lib gemini_live::tests::real_api -- --ignored --nocapture
 
-use super::provider::{GeminiLiveProvider, GeminiLiveStatus, StatusCallback};
+use super::provider::{Backup, GeminiLiveProvider, GeminiLiveStatus, RetryPolicy, StatusCallback};
 use super::protocol::SetupOptions;
 use crate::audio::transcription::provider::{TranscriptionError, TranscriptionProvider, TranscriptResult};
 use async_trait::async_trait;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use std::time::Duration;
 
 const KEY: &str = "test-key";
 
@@ -40,9 +41,12 @@ struct Stats {
     connections: AtomicUsize,
     /// Samples received per segment, per connection.
     segments: Mutex<Vec<Vec<usize>>>,
+    /// API key used by each connection, in order of completed handshakes.
+    keys: Mutex<Vec<String>>,
 }
 
-type Plan = Arc<dyn Fn(usize) -> ConnPlan + Send + Sync>;
+/// Behaviour of a connection, from its index and the API key it authenticated with.
+type Plan = Arc<dyn Fn(usize, &str) -> ConnPlan + Send + Sync>;
 type Reply = Arc<dyn Fn(usize, usize) -> String + Send + Sync>;
 
 async fn start_mock(plan: Plan, reply: Reply) -> (String, Arc<Stats>) {
@@ -55,19 +59,25 @@ async fn start_mock(plan: Plan, reply: Reply) -> (String, Arc<Stats>) {
             let (tcp, _) = listener.accept().await.unwrap();
             let idx = server_stats.connections.fetch_add(1, Ordering::SeqCst);
             server_stats.segments.lock().unwrap().push(Vec::new());
-            tokio::spawn(serve(tcp, idx, plan(idx), reply.clone(), server_stats.clone()));
+            tokio::spawn(serve(tcp, idx, plan.clone(), reply.clone(), server_stats.clone()));
         }
     });
     (format!("ws://127.0.0.1:{}/ws", port), stats)
 }
 
-async fn serve(tcp: tokio::net::TcpStream, idx: usize, plan: ConnPlan, reply: Reply, stats: Arc<Stats>) {
-    let check_key = |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                     resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-        assert_eq!(req.headers().get("x-goog-api-key").unwrap(), KEY);
+async fn serve(tcp: tokio::net::TcpStream, idx: usize, plan: Plan, reply: Reply, stats: Arc<Stats>) {
+    let key = Arc::new(Mutex::new(String::new()));
+    let seen_key = key.clone();
+    let read_key = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                         resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+        let k = req.headers().get("x-goog-api-key").expect("API key header");
+        *seen_key.lock().unwrap() = k.to_str().unwrap().to_string();
         Ok(resp)
     };
-    let mut ws = tokio_tungstenite::accept_hdr_async(tcp, check_key).await.unwrap();
+    let mut ws = tokio_tungstenite::accept_hdr_async(tcp, read_key).await.unwrap();
+    let key = key.lock().unwrap().clone();
+    stats.keys.lock().unwrap().push(key.clone());
+    let plan = plan(idx, &key);
     let (mut frames, mut samples, mut segment, mut active) = (0usize, 0usize, 0usize, false);
     let text = |s: String| Message::Text(s);
     while let Some(Ok(msg)) = ws.next().await {
@@ -142,18 +152,48 @@ struct Harness {
     stats: Arc<Stats>,
     local: Arc<LocalMock>,
     statuses: Arc<Mutex<Vec<&'static str>>>,
+    live: Arc<AtomicBool>,
+}
+
+enum Mode {
+    LocalBackup,
+    CloudOnly,
 }
 
 impl Harness {
-    async fn new(plan: impl Fn(usize) -> ConnPlan + Send + Sync + 'static, reply: impl Fn(usize, usize) -> String + Send + Sync + 'static) -> Self {
+    async fn new(
+        plan: impl Fn(usize) -> ConnPlan + Send + Sync + 'static,
+        reply: impl Fn(usize, usize) -> String + Send + Sync + 'static,
+    ) -> Self {
+        Self::build(vec![KEY], Mode::LocalBackup, move |idx, _| plan(idx), reply).await
+    }
+
+    async fn build(
+        keys: Vec<&str>,
+        mode: Mode,
+        plan: impl Fn(usize, &str) -> ConnPlan + Send + Sync + 'static,
+        reply: impl Fn(usize, usize) -> String + Send + Sync + 'static,
+    ) -> Self {
         let (url, stats) = start_mock(Arc::new(plan), Arc::new(reply)).await;
         let local = Arc::new(LocalMock { calls: AtomicUsize::new(0) });
         let statuses = Arc::new(Mutex::new(Vec::new()));
         let sink = statuses.clone();
         let on_status: StatusCallback = Arc::new(move |s: GeminiLiveStatus| sink.lock().unwrap().push(s.kind));
-        let provider = GeminiLiveProvider::new(KEY.into(), SetupOptions::default(), Some(local.clone()), on_status)
-            .with_endpoint(url);
-        Self { provider, stats, local, statuses }
+        let backup = match mode {
+            Mode::LocalBackup => Backup::Local(local.clone()),
+            Mode::CloudOnly => Backup::HoldAndRetry,
+        };
+        let live = Arc::new(AtomicBool::new(true));
+        let live_check = live.clone();
+        let provider = GeminiLiveProvider::new(keys.into_iter().map(String::from).collect(), SetupOptions::default(), backup, on_status)
+            .with_endpoint(url)
+            .with_retry_policy(RetryPolicy {
+                initial_delay: Duration::from_millis(20),
+                max_delay: Duration::from_millis(50),
+                after_stop: Duration::from_millis(300),
+            })
+            .with_live_check(Arc::new(move || live_check.load(Ordering::SeqCst)));
+        Self { provider, stats, local, statuses, live }
     }
 
     async fn say(&self, secs: f64) -> String {
@@ -163,6 +203,10 @@ impl Harness {
 
     fn connections(&self) -> usize {
         self.stats.connections.load(Ordering::SeqCst)
+    }
+
+    fn statuses(&self) -> Vec<&'static str> {
+        self.statuses.lock().unwrap().clone()
     }
 }
 
@@ -187,7 +231,7 @@ async fn bad_key_uses_local_engine_for_rest_of_recording() {
     assert_eq!(h.say(0.5).await, "local");
     assert_eq!(h.say(0.5).await, "local");
     assert_eq!(h.connections(), 1, "no reconnect attempts after an auth failure");
-    assert_eq!(*h.statuses.lock().unwrap(), vec!["disabled"]);
+    assert_eq!(h.statuses(), vec!["disabled"]);
 }
 
 #[tokio::test]
@@ -223,7 +267,7 @@ async fn go_away_rotates_session_with_overlap_and_dedup() {
     assert_eq!(segments[1], vec![32000, 16000], "new session primed with last 2 s, then the segment");
     drop(segments);
     assert_eq!(h.say(0.5).await, "later");
-    assert!(h.statuses.lock().unwrap().is_empty());
+    assert!(h.statuses().is_empty());
 }
 
 #[tokio::test]
@@ -232,7 +276,7 @@ async fn repeated_failures_pause_gemini_and_use_local() {
     for _ in 0..3 {
         assert_eq!(h.say(0.5).await, "local");
     }
-    assert_eq!(*h.statuses.lock().unwrap(), vec!["fallback"]);
+    assert_eq!(h.statuses(), vec!["fallback"]);
     let before = h.connections();
     assert_eq!(h.say(0.5).await, "local");
     assert_eq!(h.connections(), before, "Gemini is paused during the cooldown");
@@ -246,6 +290,89 @@ async fn non_speech_segment_returns_empty_quickly() {
     assert_eq!(h.say(1.0).await, "");
     assert!(started.elapsed().as_secs_f64() < 3.0, "took {:?}", started.elapsed());
     assert_eq!(h.local.calls.load(Ordering::SeqCst), 0);
+}
+
+fn reject(key: &str) -> ConnPlan {
+    ConnPlan { reject_auth: true, ..Default::default() }.only_if(key == "bad")
+}
+
+impl ConnPlan {
+    /// This plan when `cond` holds, otherwise a healthy connection.
+    fn only_if(self, cond: bool) -> Self {
+        if cond { self } else { Self::default() }
+    }
+}
+
+#[tokio::test]
+async fn backup_key_takes_over_when_primary_is_rejected() {
+    let h = Harness::build(vec!["bad", "good"], Mode::CloudOnly, |_, key| reject(key), segment_reply).await;
+    assert_eq!(h.say(0.5).await, "conn1 seg0");
+    assert_eq!(h.say(0.5).await, "conn1 seg1", "stays on the working key");
+    assert_eq!(*h.stats.keys.lock().unwrap(), vec!["bad", "good"]);
+    assert_eq!(h.statuses(), vec!["key_switch"]);
+}
+
+#[tokio::test]
+async fn backup_key_takes_over_on_rate_limit_or_server_error() {
+    // Primary fails mid-segment every time (like a quota or server error).
+    let h = Harness::build(
+        vec!["limited", "good"],
+        Mode::LocalBackup,
+        |_, key| ConnPlan { drop_after_frames: Some(1), ..Default::default() }.only_if(key == "limited"),
+        |_, seg| format!("seg{}", seg),
+    )
+    .await;
+    assert_eq!(h.say(0.5).await, "seg0");
+    assert_eq!(h.say(0.5).await, "seg1");
+    assert_eq!(h.local.calls.load(Ordering::SeqCst), 0, "no local fallback while a key works");
+    // Primary tried twice (fresh-session retry), then the backup key.
+    assert_eq!(*h.stats.keys.lock().unwrap(), vec!["limited", "limited", "good"]);
+    assert_eq!(h.statuses(), vec!["key_switch"]);
+}
+
+#[tokio::test]
+async fn cloud_only_holds_audio_and_catches_up_after_outage() {
+    // First 4 connections fail (two segments' worth of attempts), then Gemini is back.
+    let h = Harness::build(
+        vec![KEY],
+        Mode::CloudOnly,
+        |idx, _| ConnPlan { drop_after_frames: Some(1), ..Default::default() }.only_if(idx < 4),
+        |_, seg| format!("seg{}", seg),
+    )
+    .await;
+    assert_eq!(h.say(0.5).await, "seg0", "held segment is transcribed once Gemini returns");
+    assert_eq!(h.say(0.5).await, "seg1");
+    assert_eq!(h.statuses(), vec!["outage", "recovered"]);
+    assert_eq!(h.local.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cloud_only_gives_up_after_stop_when_still_unreachable() {
+    let h = Harness::build(
+        vec![KEY],
+        Mode::CloudOnly,
+        |_, _| ConnPlan { drop_after_frames: Some(1), ..Default::default() },
+        segment_reply,
+    )
+    .await;
+    h.live.store(false, Ordering::SeqCst); // Stop was pressed
+    let started = std::time::Instant::now();
+    assert_eq!(h.say(0.5).await, "");
+    assert!(started.elapsed() < Duration::from_secs(5), "gives up after the stop grace period");
+    assert_eq!(h.statuses(), vec!["outage", "gave_up"]);
+    let before = h.connections();
+    assert_eq!(h.say(0.5).await, "");
+    assert_eq!(h.connections(), before, "no more attempts after giving up");
+}
+
+#[tokio::test]
+async fn cloud_only_stops_when_every_key_is_rejected() {
+    let h = Harness::build(vec!["bad", "bad2"], Mode::CloudOnly, |_, _| ConnPlan { reject_auth: true, ..Default::default() }, segment_reply).await;
+    assert_eq!(h.say(0.5).await, "");
+    assert_eq!(h.statuses(), vec!["key_switch", "disabled"]);
+    let before = h.connections();
+    assert_eq!(h.say(0.5).await, "");
+    assert_eq!(h.connections(), before);
 }
 
 /// Split s16le PCM into speech segments on 300 ms pauses, like the app's VAD output.
@@ -284,7 +411,10 @@ async fn real_api_hinglish_clip() {
         ..Default::default()
     };
     let on_status: StatusCallback = Arc::new(|s: GeminiLiveStatus| println!("status: {:?}", s));
-    let provider = GeminiLiveProvider::new(key, settings.setup_options(), None, on_status);
+    // An invalid primary key exercises the real rejection (close 1007) and the switch to
+    // the backup key.
+    let keys = vec!["AIzaSyInvalidPrimaryKeyForMeetilyTests000".to_string(), key];
+    let provider = GeminiLiveProvider::new(keys, settings.setup_options(), Backup::HoldAndRetry, on_status);
     let mut all = Vec::new();
     for (i, segment) in split_on_silence(&pcm).into_iter().enumerate() {
         let started = std::time::Instant::now();

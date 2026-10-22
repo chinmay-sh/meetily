@@ -1,6 +1,7 @@
 // audio/transcription/gemini_live/provider.rs
 //
-// TranscriptionProvider backed by Gemini Live, with session rotation and local fallback.
+// TranscriptionProvider backed by Gemini Live, with session rotation, multiple API keys
+// and two ways of handling outages.
 //
 // - One WebSocket session is reused across VAD segments (keeps language context).
 // - Sessions are rotated between segments before the ~10 minute connection cap, or as
@@ -9,9 +10,16 @@
 //   is de-duplicated against the previously emitted text.
 // - A segment that fails mid-stream is retried once on a fresh session; text from the
 //   failed attempt is discarded, so nothing is emitted twice.
-// - Auth failures switch to the local engine for the rest of the recording;
-//   MAX_CONSECUTIVE_FAILURES transient failures pause Gemini for COOLDOWN. The failed
-//   segment itself is always transcribed locally, so no audio is lost.
+// - Keys are tried in order. When the key in use fails for any reason, the same segment
+//   is retried immediately with the next key. Rejected keys (invalid/missing) are skipped
+//   for the rest of the recording; keys with other errors (rate limits, quota, network)
+//   are tried last for KEY_COOLDOWN.
+// - When every key fails:
+//   - Backup::Local: the segment is transcribed by the local engine;
+//     MAX_CONSECUTIVE_FAILURES in a row pause Gemini for LOCAL_COOLDOWN.
+//   - Backup::HoldAndRetry (cloud only): the segment is held and retried with backoff
+//     while later segments queue up behind it, so the transcript catches up when Gemini
+//     returns. After the recording stops, retrying gives up after RetryPolicy::after_stop.
 
 use super::connection::{LiveConnection, LiveError, PACE_FACTOR};
 use super::dedup::trim_overlap;
@@ -27,56 +35,108 @@ use tokio::sync::Mutex;
 const ROTATE_AFTER: Duration = Duration::from_secs(8 * 60 + 30);
 const PRIME_SECS: f64 = 2.0;
 const MIN_PRIME_SAMPLES: usize = 8000; // 0.5 s
+const KEY_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-const COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const LOCAL_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
-/// Status notices for the UI (e.g. "switched to local transcription").
+/// Status notices for the UI (key switches, outages, fallback).
 pub type StatusCallback = Arc<dyn Fn(GeminiLiveStatus) + Send + Sync>;
+/// Whether the recording is still live (false once Stop was pressed).
+pub type LiveCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GeminiLiveStatus {
-    /// "fallback" | "resumed" | "disabled"
+    /// "key_switch" | "outage" | "recovered" | "gave_up" | "fallback" | "resumed" | "disabled"
     pub kind: &'static str,
     pub message: String,
+}
+
+/// What to do when every key fails.
+pub enum Backup {
+    Local(Arc<dyn TranscriptionProvider>),
+    HoldAndRetry,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    pub initial_delay: Duration,
+    pub max_delay: Duration,
+    /// How long to keep retrying held audio after the recording stopped.
+    pub after_stop: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_secs(2),
+            max_delay: Duration::from_secs(30),
+            after_stop: Duration::from_secs(3 * 60),
+        }
+    }
+}
+
+enum KeysError {
+    /// Every key was rejected; retrying cannot help.
+    AllRejected(String),
+    /// At least one key failed for a reason that may go away (network, quota, server).
+    Failed(String),
+}
+
+#[derive(Default, Clone)]
+struct KeySlot {
+    rejected: bool,
+    cooling_until: Option<Instant>,
 }
 
 #[derive(Default)]
 struct State {
     conn: Option<LiveConnection>,
     had_connection: bool,
-    consecutive_failures: u32,
-    paused_until: Option<Instant>,
-    disabled: bool,
+    keys: Vec<KeySlot>,
+    current: usize,
     last_text: String,
     tail_audio: Vec<f32>,
     dedup_next: bool,
     /// Late text from a retired session, prepended to the next result.
     carry_text: String,
+    // Backup::Local
+    consecutive_failures: u32,
+    paused_until: Option<Instant>,
+    rejected_notified: bool,
+    // Backup::HoldAndRetry
+    outage_since: Option<Instant>,
+    stopped_at: Option<Instant>,
+    gave_up: bool,
 }
 
 pub struct GeminiLiveProvider {
     endpoint: String,
-    api_key: String,
+    api_keys: Vec<String>,
     setup: SetupOptions,
-    fallback: Option<Arc<dyn TranscriptionProvider>>,
+    backup: Backup,
+    retry: RetryPolicy,
+    is_live: LiveCheck,
     on_status: StatusCallback,
     state: Mutex<State>,
 }
 
+fn key_hint(key: &str) -> String {
+    let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("…{}", tail)
+}
+
 impl GeminiLiveProvider {
-    pub fn new(
-        api_key: String,
-        setup: SetupOptions,
-        fallback: Option<Arc<dyn TranscriptionProvider>>,
-        on_status: StatusCallback,
-    ) -> Self {
+    pub fn new(api_keys: Vec<String>, setup: SetupOptions, backup: Backup, on_status: StatusCallback) -> Self {
+        let state = State { keys: vec![KeySlot::default(); api_keys.len()], ..Default::default() };
         Self {
             endpoint: super::protocol::WS_URL.to_string(),
-            api_key,
+            api_keys,
             setup,
-            fallback,
+            backup,
+            retry: RetryPolicy::default(),
+            is_live: Arc::new(|| true),
             on_status,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(state),
         }
     }
 
@@ -85,8 +145,26 @@ impl GeminiLiveProvider {
         self
     }
 
-    fn fallback_name(&self) -> &'static str {
-        self.fallback.as_ref().map(|f| f.provider_name()).unwrap_or("local engine")
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    pub fn with_live_check(mut self, is_live: LiveCheck) -> Self {
+        self.is_live = is_live;
+        self
+    }
+
+    fn notify(&self, kind: &'static str, message: String) {
+        info!("Gemini Live status [{}]: {}", kind, message);
+        (self.on_status)(GeminiLiveStatus { kind, message });
+    }
+
+    fn backup_name(&self) -> &'static str {
+        match &self.backup {
+            Backup::Local(f) => f.provider_name(),
+            Backup::HoldAndRetry => "none",
+        }
     }
 
     async fn ensure_connection(&self, st: &mut State) -> Result<(), LiveError> {
@@ -103,10 +181,11 @@ impl GeminiLiveProvider {
             }
         };
         if st.had_connection {
-            info!("🔄 Gemini Live: opening new session ({})", reason);
+            info!("🔄 Gemini Live: opening new session ({}, key #{})", reason, st.current + 1);
         }
         // Make before break: the old session (if any) stays open until the new one is ready.
-        let mut fresh = LiveConnection::connect_to(&self.endpoint, &self.api_key, &self.setup).await?;
+        let key = &self.api_keys[st.current];
+        let mut fresh = LiveConnection::connect_to(&self.endpoint, key, &self.setup).await?;
         if st.had_connection && st.tail_audio.len() >= MIN_PRIME_SAMPLES {
             match fresh.transcribe_segment(&st.tail_audio, PACE_FACTOR).await {
                 Ok(_) => st.dedup_next = true,
@@ -125,9 +204,11 @@ impl GeminiLiveProvider {
         Ok(())
     }
 
-    async fn transcribe_with_gemini(&self, st: &mut State, audio: &[f32]) -> Result<String, LiveError> {
-        let mut last_err = None;
-        for attempt in 0..2 {
+    /// One key: connect if needed, stream the segment; a mid-segment failure is retried
+    /// once on a fresh session with the same key.
+    async fn transcribe_with_key(&self, st: &mut State, audio: &[f32]) -> Result<String, LiveError> {
+        let mut attempt = 0;
+        loop {
             self.ensure_connection(st).await?;
             let conn = st.conn.as_mut().expect("connection ensured above");
             match conn.transcribe_segment(audio, PACE_FACTOR).await {
@@ -151,25 +232,190 @@ impl GeminiLiveProvider {
                 }
                 Err(LiveError::Auth(m)) => return Err(LiveError::Auth(m)),
                 Err(e) => {
-                    warn!("Gemini Live: segment attempt {} failed: {}", attempt + 1, e);
+                    warn!("Gemini Live: segment attempt {} failed on key #{}: {}", attempt + 1, st.current + 1, e);
                     st.conn = None;
-                    last_err = Some(e);
+                    attempt += 1;
+                    if attempt >= 2 {
+                        return Err(e);
+                    }
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| LiveError::Transient("unknown failure".into())))
     }
 
-    async fn transcribe_locally(
+    /// Try every usable key, starting with the one in use; healthy keys before cooling ones.
+    async fn transcribe_with_keys(&self, st: &mut State, audio: &[f32]) -> Result<String, KeysError> {
+        let now = Instant::now();
+        let n = self.api_keys.len();
+        let mut order: Vec<usize> = (0..n).map(|i| (st.current + i) % n).filter(|&i| !st.keys[i].rejected).collect();
+        order.sort_by_key(|&i| st.keys[i].cooling_until.map_or(false, |t| t > now));
+
+        let mut last_error = String::from("no usable API key");
+        let mut previous_failure: Option<String> = None;
+        for i in order {
+            if i != st.current {
+                if let Some(old) = st.conn.take() {
+                    old.close_in_background();
+                }
+                let from = st.current;
+                st.current = i;
+                if let Some(reason) = previous_failure.take() {
+                    self.notify(
+                        "key_switch",
+                        format!(
+                            "Gemini key #{} failed ({}). Switched to key #{} ({}).",
+                            from + 1,
+                            reason,
+                            i + 1,
+                            key_hint(&self.api_keys[i])
+                        ),
+                    );
+                }
+            }
+            match self.transcribe_with_key(st, audio).await {
+                Ok(text) => {
+                    st.keys[i].cooling_until = None;
+                    return Ok(text);
+                }
+                Err(LiveError::Auth(m)) => {
+                    warn!("Gemini Live: key #{} rejected: {}", i + 1, m);
+                    st.keys[i].rejected = true;
+                    previous_failure = Some(m.clone());
+                    last_error = m;
+                }
+                Err(LiveError::Transient(m)) => {
+                    st.keys[i].cooling_until = Some(Instant::now() + KEY_COOLDOWN);
+                    previous_failure = Some(m.clone());
+                    last_error = m;
+                }
+            }
+            st.conn = None;
+        }
+        if st.keys.iter().all(|k| k.rejected) {
+            Err(KeysError::AllRejected(last_error))
+        } else {
+            Err(KeysError::Failed(last_error))
+        }
+    }
+
+    async fn transcribe_with_local_backup(
         &self,
+        local: &Arc<dyn TranscriptionProvider>,
         audio: Vec<f32>,
         language: Option<String>,
     ) -> Result<TranscriptResult, TranscriptionError> {
-        match &self.fallback {
-            Some(fallback) => fallback.transcribe(audio, language).await,
-            None => Err(TranscriptionError::EngineFailed(
-                "Gemini Live is unavailable and no local fallback model is loaded".into(),
-            )),
+        let mut st = self.state.lock().await;
+        let paused = st.paused_until.map_or(false, |t| Instant::now() < t);
+        let any_key = st.keys.iter().any(|k| !k.rejected);
+        if any_key && !paused {
+            match self.transcribe_with_keys(&mut st, &audio).await {
+                Ok(text) => {
+                    st.consecutive_failures = 0;
+                    if st.paused_until.take().is_some() {
+                        self.notify("resumed", "Gemini Live transcription resumed.".into());
+                    }
+                    return Ok(TranscriptResult { text, confidence: None, is_partial: false });
+                }
+                Err(KeysError::AllRejected(msg)) => {
+                    if !std::mem::replace(&mut st.rejected_notified, true) {
+                        self.notify(
+                            "disabled",
+                            format!(
+                                "Gemini rejected all API keys ({}). Using {} for the rest of this recording.",
+                                msg,
+                                self.backup_name()
+                            ),
+                        );
+                    }
+                }
+                Err(KeysError::Failed(msg)) => {
+                    st.consecutive_failures += 1;
+                    if st.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        st.consecutive_failures = 0;
+                        st.paused_until = Some(Instant::now() + LOCAL_COOLDOWN);
+                        self.notify(
+                            "fallback",
+                            format!(
+                                "Gemini Live keeps failing ({}). Using {} for the next {} minutes.",
+                                msg,
+                                self.backup_name(),
+                                LOCAL_COOLDOWN.as_secs() / 60
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        // While paused, Gemini is retried on the first segment after the cooldown ends.
+        drop(st);
+        local.transcribe(audio, language).await
+    }
+
+    async fn transcribe_holding(&self, audio: Vec<f32>) -> Result<TranscriptResult, TranscriptionError> {
+        let empty = || Ok(TranscriptResult { text: String::new(), confidence: None, is_partial: false });
+        // Held for the whole call: segments queue up behind this one in order.
+        let mut st = self.state.lock().await;
+        if st.gave_up {
+            return empty();
+        }
+        let mut delay = self.retry.initial_delay;
+        loop {
+            match self.transcribe_with_keys(&mut st, &audio).await {
+                Ok(text) => {
+                    if let Some(since) = st.outage_since.take() {
+                        self.notify(
+                            "recovered",
+                            format!(
+                                "Gemini Live is reachable again after {}s. Catching up on the held audio.",
+                                since.elapsed().as_secs()
+                            ),
+                        );
+                    }
+                    return Ok(TranscriptResult { text, confidence: None, is_partial: false });
+                }
+                Err(KeysError::AllRejected(msg)) => {
+                    st.gave_up = true;
+                    self.notify(
+                        "disabled",
+                        format!(
+                            "Gemini rejected all API keys ({}). Transcription stopped for this recording; \
+                             the audio is still being recorded. Check your keys in Settings → Transcription.",
+                            msg
+                        ),
+                    );
+                    return empty();
+                }
+                Err(KeysError::Failed(msg)) => {
+                    if st.outage_since.is_none() {
+                        st.outage_since = Some(Instant::now());
+                        self.notify(
+                            "outage",
+                            format!(
+                                "Gemini Live can't be reached ({}). Holding the audio and retrying; \
+                                 the transcript will catch up.",
+                                msg
+                            ),
+                        );
+                    }
+                    if !(self.is_live)() {
+                        let stopped_at = *st.stopped_at.get_or_insert_with(Instant::now);
+                        if stopped_at.elapsed() >= self.retry.after_stop {
+                            st.gave_up = true;
+                            self.notify(
+                                "gave_up",
+                                format!(
+                                    "Gemini Live was still unreachable {}s after the recording stopped. \
+                                     Some speech was not transcribed; the audio recording is saved.",
+                                    self.retry.after_stop.as_secs()
+                                ),
+                            );
+                            return empty();
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(self.retry.max_delay);
+                }
+            }
         }
     }
 }
@@ -181,59 +427,10 @@ impl TranscriptionProvider for GeminiLiveProvider {
         audio: Vec<f32>,
         language: Option<String>,
     ) -> Result<TranscriptResult, TranscriptionError> {
-        // Held for the whole call: the worker is serial and segments must stay in order.
-        let mut st = self.state.lock().await;
-
-        let paused = st.paused_until.map_or(false, |t| Instant::now() < t);
-        if !st.disabled && !paused {
-            match self.transcribe_with_gemini(&mut st, &audio).await {
-                Ok(text) => {
-                    st.consecutive_failures = 0;
-                    if st.paused_until.take().is_some() {
-                        info!("✅ Gemini Live transcription resumed");
-                        (self.on_status)(GeminiLiveStatus {
-                            kind: "resumed",
-                            message: "Gemini Live transcription resumed.".into(),
-                        });
-                    }
-                    return Ok(TranscriptResult { text, confidence: None, is_partial: false });
-                }
-                Err(LiveError::Auth(msg)) => {
-                    warn!("Gemini Live disabled for this recording: {}", msg);
-                    st.disabled = true;
-                    st.conn = None;
-                    (self.on_status)(GeminiLiveStatus {
-                        kind: "disabled",
-                        message: format!(
-                            "Gemini Live rejected the API key ({}). Using {} for the rest of this recording.",
-                            msg,
-                            self.fallback_name()
-                        ),
-                    });
-                }
-                Err(e) => {
-                    st.consecutive_failures += 1;
-                    warn!("Gemini Live failure {}/{}: {}", st.consecutive_failures, MAX_CONSECUTIVE_FAILURES, e);
-                    if st.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        st.consecutive_failures = 0;
-                        st.paused_until = Some(Instant::now() + COOLDOWN);
-                        st.conn = None;
-                        (self.on_status)(GeminiLiveStatus {
-                            kind: "fallback",
-                            message: format!(
-                                "Gemini Live keeps failing ({}). Using {} for the next {} minutes.",
-                                e,
-                                self.fallback_name(),
-                                COOLDOWN.as_secs() / 60
-                            ),
-                        });
-                    }
-                }
-            }
+        match &self.backup {
+            Backup::Local(local) => self.transcribe_with_local_backup(local, audio, language).await,
+            Backup::HoldAndRetry => self.transcribe_holding(audio).await,
         }
-        // While paused, Gemini is retried on the first segment after the cooldown ends.
-        drop(st);
-        self.transcribe_locally(audio, language).await
     }
 
     async fn is_model_loaded(&self) -> bool {

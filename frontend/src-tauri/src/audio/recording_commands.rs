@@ -47,7 +47,7 @@ static IS_RECORDING_STOPPING: AtomicBool = AtomicBool::new(false);
 
 /// Recording is live and not being torn down — the only state in which the
 /// mic-disconnect fallback should run or report.
-fn recording_live() -> bool {
+pub(crate) fn recording_live() -> bool {
     IS_RECORDING.load(Ordering::SeqCst) && !IS_RECORDING_STOPPING.load(Ordering::SeqCst)
 }
 

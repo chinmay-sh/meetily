@@ -11,8 +11,10 @@ export function GeminiLiveStatusToasts() {
     let unlisten: (() => void) | undefined;
     let disposed = false;
     listen<GeminiLiveStatus>('gemini-live-status', ({ payload }) => {
-      if (payload.kind === 'resumed') {
+      if (payload.kind === 'resumed' || payload.kind === 'recovered') {
         toast.success('Gemini Live', { description: payload.message, duration: 5000 });
+      } else if (payload.kind === 'key_switch') {
+        toast.info('Gemini Live', { description: payload.message, duration: 8000 });
       } else {
         toast.warning('Gemini Live', { description: payload.message, duration: 10000 });
       }

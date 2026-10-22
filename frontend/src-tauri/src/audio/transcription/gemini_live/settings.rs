@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 pub const MAX_VOCABULARY_TERMS: usize = 1000;
+pub const MAX_API_KEYS: usize = 10;
+
+/// `fallback_provider` value for cloud-only mode: no local model, failed audio is
+/// held and retried until Gemini is reachable again.
+pub const FALLBACK_NONE: &str = "none";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -16,7 +21,7 @@ pub struct GeminiLiveSettings {
     pub custom_vocabulary: Vec<String>,
     /// "VERBATIM" | "SMART"
     pub transcription_mode: String,
-    /// "parakeet" | "localWhisper"
+    /// "none" (cloud only) | "parakeet" | "localWhisper"
     pub fallback_provider: String,
 }
 
@@ -26,7 +31,7 @@ impl Default for GeminiLiveSettings {
             language_mode: "roman".into(),
             custom_vocabulary: Vec::new(),
             transcription_mode: "VERBATIM".into(),
-            fallback_provider: "parakeet".into(),
+            fallback_provider: FALLBACK_NONE.into(),
         }
     }
 }
@@ -40,8 +45,8 @@ impl GeminiLiveSettings {
         if !matches!(self.transcription_mode.as_str(), "VERBATIM" | "SMART") {
             self.transcription_mode = "VERBATIM".into();
         }
-        if !matches!(self.fallback_provider.as_str(), "parakeet" | "localWhisper") {
-            self.fallback_provider = "parakeet".into();
+        if !matches!(self.fallback_provider.as_str(), FALLBACK_NONE | "parakeet" | "localWhisper") {
+            self.fallback_provider = FALLBACK_NONE.into();
         }
         let mut seen = std::collections::HashSet::new();
         self.custom_vocabulary = self
@@ -52,6 +57,10 @@ impl GeminiLiveSettings {
             .take(MAX_VOCABULARY_TERMS)
             .collect();
         self
+    }
+
+    pub fn uses_local_fallback(&self) -> bool {
+        self.fallback_provider != FALLBACK_NONE
     }
 
     /// Language codes were chosen from live tests with Hindi-English speech:
@@ -71,43 +80,67 @@ impl GeminiLiveSettings {
     }
 }
 
-pub async fn load(pool: &SqlitePool) -> Result<(GeminiLiveSettings, Option<String>), sqlx::Error> {
-    let row: Option<(Option<String>, String, String, String, String)> = sqlx::query_as(
-        "SELECT api_key, language_mode, custom_vocabulary, transcription_mode, fallback_provider \
+/// Trim, drop empties and duplicates, keep order, cap the count.
+pub fn clean_keys(keys: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    keys.into_iter()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty() && seen.insert(k.clone()))
+        .take(MAX_API_KEYS)
+        .collect()
+}
+
+/// Settings plus the ordered API keys saved for Gemini Live (primary first).
+pub async fn load(pool: &SqlitePool) -> Result<(GeminiLiveSettings, Vec<String>), sqlx::Error> {
+    let row: Option<(Option<String>, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT api_key, api_keys, language_mode, custom_vocabulary, transcription_mode, fallback_provider \
          FROM gemini_live_settings WHERE id = '1'",
     )
     .fetch_optional(pool)
     .await?;
 
     Ok(match row {
-        Some((api_key, language_mode, vocabulary, transcription_mode, fallback_provider)) => (
-            GeminiLiveSettings {
-                language_mode,
-                custom_vocabulary: serde_json::from_str(&vocabulary).unwrap_or_default(),
-                transcription_mode,
-                fallback_provider,
+        Some((legacy_key, keys, language_mode, vocabulary, transcription_mode, fallback_provider)) => {
+            let mut keys: Vec<String> = serde_json::from_str(&keys).unwrap_or_default();
+            if keys.is_empty() {
+                // Single key saved before multiple keys were supported.
+                keys.extend(legacy_key);
             }
-            .normalized(),
-            api_key.filter(|k| !k.trim().is_empty()),
-        ),
-        None => (GeminiLiveSettings::default(), None),
+            (
+                GeminiLiveSettings {
+                    language_mode,
+                    custom_vocabulary: serde_json::from_str(&vocabulary).unwrap_or_default(),
+                    transcription_mode,
+                    fallback_provider,
+                }
+                .normalized(),
+                clean_keys(keys),
+            )
+        }
+        None => (GeminiLiveSettings::default(), Vec::new()),
     })
 }
 
-/// Save settings. `api_key`: Some(non-empty) replaces the key, Some("") clears it,
-/// None keeps the stored key.
-pub async fn save(
-    pool: &SqlitePool,
-    settings: &GeminiLiveSettings,
-    api_key: Option<&str>,
-) -> Result<(), sqlx::Error> {
+async fn ensure_row(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let defaults = GeminiLiveSettings::default();
+    sqlx::query(
+        "INSERT OR IGNORE INTO gemini_live_settings (id, language_mode, custom_vocabulary, transcription_mode, fallback_provider) \
+         VALUES ('1', $1, '[]', $2, $3)",
+    )
+    .bind(&defaults.language_mode)
+    .bind(&defaults.transcription_mode)
+    .bind(&defaults.fallback_provider)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn save(pool: &SqlitePool, settings: &GeminiLiveSettings) -> Result<(), sqlx::Error> {
+    ensure_row(pool).await?;
     let vocabulary = serde_json::to_string(&settings.custom_vocabulary).unwrap_or_else(|_| "[]".into());
     sqlx::query(
-        "INSERT INTO gemini_live_settings (id, language_mode, custom_vocabulary, transcription_mode, fallback_provider) \
-         VALUES ('1', $1, $2, $3, $4) \
-         ON CONFLICT(id) DO UPDATE SET language_mode = excluded.language_mode, \
-         custom_vocabulary = excluded.custom_vocabulary, transcription_mode = excluded.transcription_mode, \
-         fallback_provider = excluded.fallback_provider",
+        "UPDATE gemini_live_settings SET language_mode = $1, custom_vocabulary = $2, \
+         transcription_mode = $3, fallback_provider = $4 WHERE id = '1'",
     )
     .bind(&settings.language_mode)
     .bind(&vocabulary)
@@ -115,15 +148,18 @@ pub async fn save(
     .bind(&settings.fallback_provider)
     .execute(pool)
     .await?;
-
-    if let Some(key) = api_key {
-        let key = key.trim();
-        sqlx::query("UPDATE gemini_live_settings SET api_key = $1 WHERE id = '1'")
-            .bind(if key.is_empty() { None } else { Some(key) })
-            .execute(pool)
-            .await?;
-    }
     Ok(())
+}
+
+/// Replace the ordered key list.
+pub async fn save_keys(pool: &SqlitePool, keys: Vec<String>) -> Result<Vec<String>, sqlx::Error> {
+    ensure_row(pool).await?;
+    let keys = clean_keys(keys);
+    sqlx::query("UPDATE gemini_live_settings SET api_keys = $1, api_key = NULL WHERE id = '1'")
+        .bind(serde_json::to_string(&keys).unwrap_or_else(|_| "[]".into()))
+        .execute(pool)
+        .await?;
+    Ok(keys)
 }
 
 /// The Gemini key saved for summaries (Settings → Summary), used when no
@@ -163,8 +199,24 @@ mod tests {
         .normalized();
         assert_eq!(s.language_mode, "roman");
         assert_eq!(s.transcription_mode, "VERBATIM");
-        assert_eq!(s.fallback_provider, "parakeet");
+        assert_eq!(s.fallback_provider, FALLBACK_NONE);
         assert_eq!(s.custom_vocabulary, vec!["Meetily", "BigQuery"]);
+    }
+
+    #[test]
+    fn caps_vocabulary_size() {
+        let s = GeminiLiveSettings {
+            custom_vocabulary: (0..1500).map(|i| format!("term{}", i)).collect(),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(s.custom_vocabulary.len(), MAX_VOCABULARY_TERMS);
+    }
+
+    #[test]
+    fn cleans_keys() {
+        let keys = clean_keys(vec![" a ".into(), "".into(), "b".into(), "a".into()]);
+        assert_eq!(keys, vec!["a", "b"]);
     }
 
     #[tokio::test]
@@ -176,7 +228,7 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
-        assert_eq!(load(&pool).await.unwrap(), (GeminiLiveSettings::default(), None));
+        assert_eq!(load(&pool).await.unwrap(), (GeminiLiveSettings::default(), vec![]));
 
         let s = GeminiLiveSettings {
             language_mode: "devanagari".into(),
@@ -184,13 +236,21 @@ mod tests {
             transcription_mode: "SMART".into(),
             fallback_provider: "localWhisper".into(),
         };
-        save(&pool, &s, Some("key-1234")).await.unwrap();
-        assert_eq!(load(&pool).await.unwrap(), (s.clone(), Some("key-1234".into())));
+        save(&pool, &s).await.unwrap();
+        save_keys(&pool, vec!["key-1".into(), "key-2".into()]).await.unwrap();
+        assert_eq!(load(&pool).await.unwrap(), (s.clone(), vec!["key-1".to_string(), "key-2".to_string()]));
 
-        save(&pool, &s, None).await.unwrap(); // None keeps the key
-        assert_eq!(load(&pool).await.unwrap().1, Some("key-1234".into()));
-        save(&pool, &s, Some("")).await.unwrap(); // "" removes it
-        assert_eq!(load(&pool).await.unwrap().1, None);
+        // Saving settings keeps the keys.
+        save(&pool, &GeminiLiveSettings::default()).await.unwrap();
+        assert_eq!(load(&pool).await.unwrap().1.len(), 2);
+
+        // A single key saved by the first version is picked up as the primary.
+        save_keys(&pool, vec![]).await.unwrap();
+        sqlx::query("UPDATE gemini_live_settings SET api_key = 'legacy' WHERE id = '1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(load(&pool).await.unwrap().1, vec!["legacy"]);
 
         // Falls back to the summary Gemini key.
         assert_eq!(summary_gemini_key(&pool).await, None);
@@ -199,15 +259,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary_gemini_key(&pool).await, Some("summary-key".into()));
-    }
-
-    #[test]
-    fn caps_vocabulary_size() {
-        let s = GeminiLiveSettings {
-            custom_vocabulary: (0..1500).map(|i| format!("term{}", i)).collect(),
-            ..Default::default()
-        }
-        .normalized();
-        assert_eq!(s.custom_vocabulary.len(), MAX_VOCABULARY_TERMS);
     }
 }
