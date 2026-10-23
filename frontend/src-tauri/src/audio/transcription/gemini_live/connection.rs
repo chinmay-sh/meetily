@@ -1,10 +1,17 @@
 // audio/transcription/gemini_live/connection.rs
 //
 // One Gemini Live WebSocket session. `transcribe_segment` streams a VAD speech segment as
-// paced 100 ms PCM frames, sends `audioStreamEnd`, and collects the finalized text.
+// paced 100 ms PCM frames between `activityStart` and `activityEnd`, and collects the
+// finalized text.
 //
 // Pacing matters: a segment sent in one burst produced no transcription at all, while
 // 4x real time transcribed correctly, so frames are paced at PACE_FACTOR.
+//
+// Segments are marked explicitly (server-side activity detection is disabled): with
+// automatic detection the server often kept a short utterance's turn open after
+// `audioStreamEnd` and only answered once more audio arrived, sometimes dropping that
+// utterance's text. With explicit markers every segment is acknowledged with
+// ACTIVITY_END (after any text), which is how a segment is known to be complete.
 
 use super::pcm;
 use super::protocol::{self, ServerEvent, SetupOptions};
@@ -22,12 +29,11 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long to wait after `audioStreamEnd` for the server to report speech. Segments the
-/// server considers non-speech get no reply at all.
-const NO_SPEECH_WAIT: Duration = Duration::from_millis(1500);
-/// After `generationComplete`, wait briefly in case another utterance from the same
-/// segment is still being finalized.
-const TURN_DONE_GRACE: Duration = Duration::from_millis(250);
+/// How long to wait for ACTIVITY_END after `activityEnd`. Replies normally take ~0.3 s;
+/// delays of ~5-10 s were measured. No acknowledgement by then means the session stalled.
+pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+
+static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub const PACE_FACTOR: f64 = 4.0;
 
@@ -39,6 +45,8 @@ pub enum LiveError {
     Auth(String),
     /// The key hit a rate limit or quota (e.g. tokens per minute); it works again later.
     RateLimited(String),
+    /// Speech was detected but no transcription came back in time.
+    NoResponse(String),
     /// Network errors, timeouts, server-side closes.
     Transient(String),
 }
@@ -48,6 +56,7 @@ impl std::fmt::Display for LiveError {
         match self {
             Self::Auth(m) => write!(f, "Gemini rejected the request: {}", m),
             Self::RateLimited(m) => write!(f, "Gemini rate limit or quota reached: {}", m),
+            Self::NoResponse(m) => write!(f, "Gemini did not respond: {}", m),
             Self::Transient(m) => write!(f, "Gemini connection problem: {}", m),
         }
     }
@@ -80,14 +89,20 @@ pub struct LiveConnection {
     closed: bool,
     /// Finals that arrived after their segment's wait ended.
     carry: Vec<String>,
+    reply_timeout: Duration,
+    /// For the diagnostics log.
+    id: u64,
+    audio_secs_sent: f64,
 }
 
 /// Per-segment bookkeeping while waiting for results.
 #[derive(Default)]
 struct SegmentWait {
     texts: Vec<String>,
-    speech_seen: bool,
-    turn_done_at: Option<Instant>,
+    /// The server acknowledged this segment's `activityStart`.
+    started: bool,
+    /// The server acknowledged this segment's `activityEnd`: the segment is complete.
+    ended: bool,
 }
 
 impl LiveConnection {
@@ -156,6 +171,9 @@ impl LiveConnection {
             go_away: false,
             closed: false,
             carry: Vec::new(),
+            reply_timeout: DEFAULT_REPLY_TIMEOUT,
+            id: NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            audio_secs_sent: 0.0,
         };
         conn.send(protocol::setup_message(setup)).await?;
 
@@ -170,7 +188,13 @@ impl LiveConnection {
             }
         }
         info!("🌐 Gemini Live session opened (model {})", protocol::MODEL);
+        crate::gemini_diag!("session #{} opened", conn.id);
         Ok(conn)
+    }
+
+    pub fn with_reply_timeout(mut self, reply_timeout: Duration) -> Self {
+        self.reply_timeout = reply_timeout;
+        self
     }
 
     pub fn age(&self) -> Duration {
@@ -207,26 +231,25 @@ impl LiveConnection {
     fn handle(&mut self, event: ServerEvent, wait: &mut SegmentWait) -> Result<(), LiveError> {
         match event {
             ServerEvent::Final(text) => {
-                wait.speech_seen = true;
-                wait.turn_done_at = None;
                 if !text.trim().is_empty() {
                     wait.texts.push(text.trim().to_string());
                 }
             }
-            ServerEvent::ActivityStart => {
-                wait.speech_seen = true;
-                wait.turn_done_at = None;
-            }
-            ServerEvent::TurnDone => wait.turn_done_at = Some(Instant::now()),
+            ServerEvent::ActivityStart => wait.started = true,
+            // A late acknowledgement for an earlier segment arrives before this segment's
+            // ACTIVITY_START, so only an END after our START completes this segment.
+            ServerEvent::ActivityEnd => wait.ended = wait.started,
             ServerEvent::GoAway { time_left } => {
                 info!("🌐 Gemini Live goAway received (time left: {:?}); will rotate before next segment", time_left);
+                crate::gemini_diag!("session #{}: goAway (time left {:?})", self.id, time_left);
                 self.go_away = true;
             }
             ServerEvent::Closed { code, reason } => {
                 self.closed = true;
+                crate::gemini_diag!("session #{}: closed by server, code {:?}: {}", self.id, code, reason);
                 return Err(classify_close(code, &reason, false));
             }
-            ServerEvent::Interim(_) | ServerEvent::ActivityEnd | ServerEvent::SetupComplete => {}
+            ServerEvent::Interim(_) | ServerEvent::TurnDone | ServerEvent::SetupComplete => {}
         }
         Ok(())
     }
@@ -244,9 +267,11 @@ impl LiveConnection {
         let mut wait = SegmentWait { texts: std::mem::take(&mut self.carry), ..Default::default() };
         // Late finals from the previous segment.
         self.drain_pending(&mut wait)?;
-        wait.speech_seen = false;
-        wait.turn_done_at = None;
+        wait.started = false;
+        wait.ended = false;
+        let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
 
+        self.send(protocol::activity_start_message()).await?;
         let frame_period = Duration::from_secs_f64(0.1 / pace);
         let start = Instant::now();
         for (i, frame) in pcm::frames(samples).enumerate() {
@@ -254,49 +279,61 @@ impl LiveConnection {
             tokio::time::sleep_until(start + frame_period * (i as u32 + 1)).await;
             self.drain_pending(&mut wait)?;
         }
-        self.send(protocol::audio_stream_end_message()).await?;
+        self.send(protocol::activity_end_message()).await?;
         let ended = Instant::now();
 
         let segment_secs = pcm::duration_secs(samples);
-        let hard_deadline = ended + Duration::from_secs_f64((8.0 + segment_secs * 0.5).min(30.0));
-        loop {
-            let soft = match (wait.turn_done_at, wait.speech_seen) {
-                (Some(t), _) => t + TURN_DONE_GRACE,
-                (None, false) => ended + NO_SPEECH_WAIT,
-                (None, true) => hard_deadline,
-            };
-            match timeout_at(soft.min(hard_deadline), self.events.recv()).await {
+        self.audio_secs_sent += segment_secs;
+        let deadline = ended + self.reply_timeout + Duration::from_secs_f64(segment_secs * 0.25);
+        while !wait.ended {
+            match timeout_at(deadline, self.events.recv()).await {
                 Ok(Some(event)) => self.handle(event, &mut wait)?,
                 Ok(None) => {
                     self.closed = true;
+                    crate::gemini_diag!("session #{}: connection dropped", self.id);
                     return Err(LiveError::Transient("connection dropped".into()));
                 }
                 Err(_) => {
-                    if wait.turn_done_at.is_some() || !wait.speech_seen {
+                    // No acknowledgement: the session stalled. The caller retries the
+                    // segment on a fresh session.
+                    self.closed = true;
+                    let waited = deadline.duration_since(ended).as_secs_f64();
+                    crate::gemini_diag!(
+                        "session #{}: no reply {:.0}s after a {:.1}s segment ({:.0}s audio sent in session, {} final(s) so far)",
+                        self.id,
+                        waited,
+                        segment_secs,
+                        self.audio_secs_sent,
+                        wait.texts.len()
+                    );
+                    if !wait.texts.is_empty() {
+                        warn!("Gemini Live: no ACTIVITY_END before deadline; using {} final(s) received", wait.texts.len());
                         break;
                     }
-                    if wait.texts.is_empty() {
-                        // Speech was detected but nothing came back: treat the session as
-                        // stuck so the caller retries on a fresh connection.
-                        self.closed = true;
-                        return Err(LiveError::Transient(format!(
-                            "no transcription {:.0}s after a {:.1}s segment",
-                            hard_deadline.duration_since(ended).as_secs_f64(),
-                            segment_secs
-                        )));
-                    }
-                    warn!("Gemini Live: no generationComplete before deadline; using {} final(s) received", wait.texts.len());
-                    break;
+                    return Err(LiveError::NoResponse(format!(
+                        "no reply {:.0}s after a {:.1}s segment",
+                        waited, segment_secs
+                    )));
                 }
             }
         }
+        let reply_secs = ended.elapsed().as_secs_f64();
         debug!(
-            "Gemini Live segment {:.1}s -> {} final(s) in {:.2}s after stream end",
+            "Gemini Live segment {:.1}s -> {} final(s) in {:.2}s after activity end",
             segment_secs,
             wait.texts.len(),
-            ended.elapsed().as_secs_f64()
+            reply_secs
         );
-        Ok(wait.texts.join(" "))
+        let text = wait.texts.join(" ");
+        crate::gemini_diag!(
+            "session #{}: segment {:.1}s rms {:.3} -> {} chars, reply {:.2}s",
+            self.id,
+            segment_secs,
+            rms,
+            text.chars().count(),
+            reply_secs
+        );
+        Ok(text)
     }
 
     /// Close politely in the background (used when rotating to a new session).

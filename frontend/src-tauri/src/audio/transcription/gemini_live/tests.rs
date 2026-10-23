@@ -1,8 +1,9 @@
 // audio/transcription/gemini_live/tests.rs
 //
 // Provider tests against a local mock of the Gemini Live WebSocket, which behaves like
-// the real server as observed in live tests (setupComplete, voiceActivity, finals +
-// generationComplete per audioStreamEnd, goAway, auth closes with 1007).
+// the real server in manual activity mode as observed in live tests: ACTIVITY_START on
+// activityStart; finals + generationComplete (speech only) then ACTIVITY_END on
+// activityEnd; goAway; auth closes with 1007; quota closes with RESOURCE_EXHAUSTED.
 //
 // `real_api_hinglish_clip` talks to the real API and is ignored by default:
 //   GEMINI_API_KEY=... MEETILY_GEMINI_TEST_PCM=clip_16k_s16le.pcm \
@@ -36,6 +37,9 @@ struct ConnPlan {
     silent: bool,
     /// Close with a quota error when audio for this segment index starts.
     rate_limit_on_segment: Option<usize>,
+    /// Acknowledge this segment's start but never answer it (the bug seen with real
+    /// sessions under automatic activity detection).
+    stall_on_segment: Option<usize>,
 }
 
 #[derive(Default)]
@@ -80,7 +84,7 @@ async fn serve(tcp: tokio::net::TcpStream, idx: usize, plan: Plan, reply: Reply,
     let key = key.lock().unwrap().clone();
     stats.keys.lock().unwrap().push(key.clone());
     let plan = plan(idx, &key);
-    let (mut frames, mut samples, mut segment, mut active) = (0usize, 0usize, 0usize, false);
+    let (mut frames, mut samples, mut segment) = (0usize, 0usize, 0usize);
     let text = |s: String| Message::Text(s);
     while let Some(Ok(msg)) = ws.next().await {
         let Message::Text(raw) = msg else { continue };
@@ -95,7 +99,12 @@ async fn serve(tcp: tokio::net::TcpStream, idx: usize, plan: Plan, reply: Reply,
                     .await;
                 return;
             }
+            assert_eq!(v.pointer("/setup/realtimeInputConfig/automaticActivityDetection/disabled"), Some(&Value::Bool(true)));
             ws.send(text(r#"{"setupComplete":{}}"#.into())).await.unwrap();
+        } else if v.pointer("/realtimeInput/activityStart").is_some() {
+            ws.send(text(r#"{"serverContent":{},"voiceActivity":{"type":"ACTIVITY_START","audioOffset":"0s"}}"#.into()))
+                .await
+                .unwrap();
         } else if let Some(data) = v.pointer("/realtimeInput/audio/data").and_then(Value::as_str) {
             if plan.rate_limit_on_segment == Some(segment) {
                 let _ = ws
@@ -111,25 +120,20 @@ async fn serve(tcp: tokio::net::TcpStream, idx: usize, plan: Plan, reply: Reply,
             if plan.drop_after_frames == Some(frames) {
                 return; // abrupt drop
             }
-            if !active && !plan.silent {
-                active = true;
-                ws.send(text(r#"{"serverContent":{},"voiceActivity":{"type":"ACTIVITY_START","audioOffset":"0.4s"}}"#.into()))
-                    .await
-                    .unwrap();
-            }
-        } else if v.pointer("/realtimeInput/audioStreamEnd").is_some() {
+        } else if v.pointer("/realtimeInput/activityEnd").is_some() {
             stats.segments.lock().unwrap()[idx].push(samples);
-            if !plan.silent {
-                let final_msg = serde_json::json!({"serverContent": {"inputTranscription": {"text": reply(idx, segment)}}});
-                ws.send(text(final_msg.to_string())).await.unwrap();
-                ws.send(text(r#"{"serverContent":{"generationComplete":true}}"#.into())).await.unwrap();
+            if plan.stall_on_segment != Some(segment) {
+                if !plan.silent {
+                    let final_msg = serde_json::json!({"serverContent": {"inputTranscription": {"text": reply(idx, segment)}}});
+                    ws.send(text(final_msg.to_string())).await.unwrap();
+                    ws.send(text(r#"{"serverContent":{"generationComplete":true}}"#.into())).await.unwrap();
+                }
                 ws.send(text(r#"{"serverContent":{},"voiceActivity":{"type":"ACTIVITY_END","audioOffset":"1s"}}"#.into()))
                     .await
                     .unwrap();
             }
             segment += 1;
             samples = 0;
-            active = false;
             if plan.go_away_after_segments == Some(segment) {
                 ws.send(text(r#"{"goAway":{"timeLeft":"50s"}}"#.into())).await.unwrap();
             }
@@ -198,6 +202,7 @@ impl Harness {
         let live_check = live.clone();
         let provider = GeminiLiveProvider::new(keys.into_iter().map(String::from).collect(), SetupOptions::default(), backup, on_status)
             .with_endpoint(url)
+            .with_reply_timeout(Duration::from_millis(400))
             .with_retry_policy(RetryPolicy {
                 initial_delay: Duration::from_millis(20),
                 max_delay: Duration::from_millis(50),
@@ -409,6 +414,59 @@ async fn rate_limited_keys_pause_and_hand_back_to_each_other() {
     assert_eq!(h.statuses(), vec!["key_switch", "key_switch"]);
 }
 
+#[tokio::test]
+async fn stalled_segment_is_resent_on_a_fresh_session() {
+    // The first session acknowledges the segment but never answers.
+    let h = Harness::build(
+        vec![KEY],
+        Mode::CloudOnly,
+        |idx, _| ConnPlan { stall_on_segment: Some(0), ..Default::default() }.only_if(idx == 0),
+        segment_reply,
+    )
+    .await;
+    assert_eq!(h.say(0.5).await, "conn1 seg0");
+    assert_eq!(h.say(0.5).await, "conn1 seg1", "keeps using the fresh session");
+    assert!(h.statuses().is_empty());
+}
+
+#[tokio::test]
+async fn cloud_only_skips_a_segment_that_never_gets_an_answer() {
+    // Both the session and its replacement stall on this segment; transcription must
+    // move on instead of retrying it forever (which blocked everything after it).
+    let h = Harness::build(
+        vec![KEY],
+        Mode::CloudOnly,
+        |idx, _| ConnPlan { stall_on_segment: Some(0), ..Default::default() }.only_if(idx < 2),
+        segment_reply,
+    )
+    .await;
+    let started = std::time::Instant::now();
+    assert_eq!(h.say(0.5).await, "");
+    assert!(started.elapsed() < Duration::from_secs(5), "skipped promptly, took {:?}", started.elapsed());
+    assert_eq!(h.statuses(), vec!["skipped"]);
+    assert_eq!(h.say(0.5).await, "conn2 seg0", "next segment is transcribed normally");
+}
+
+#[tokio::test]
+async fn stalled_primer_does_not_poison_the_new_session() {
+    // After goAway, the replacement session stalls on its primer (segment 0); the real
+    // segment must go to a working session instead.
+    let h = Harness::build(
+        vec![KEY],
+        Mode::CloudOnly,
+        |idx, _| match idx {
+            0 => ConnPlan { go_away_after_segments: Some(1), ..Default::default() },
+            1 => ConnPlan { stall_on_segment: Some(0), ..Default::default() },
+            _ => ConnPlan::default(),
+        },
+        segment_reply,
+    )
+    .await;
+    assert_eq!(h.say(1.0).await, "conn0 seg0");
+    assert_eq!(h.say(1.0).await, "conn2 seg0");
+    assert_eq!(h.connections(), 3);
+}
+
 /// Split s16le PCM into speech segments on 300 ms pauses, like the app's VAD output.
 fn split_on_silence(pcm: &[i16]) -> Vec<Vec<f32>> {
     let frame = 480;
@@ -460,4 +518,51 @@ async fn real_api_hinglish_clip() {
     let joined = all.join(" ");
     assert!(joined.contains("Kubernetes"), "{}", joined);
     assert!(joined.contains("Meetily"), "{}", joined);
+}
+
+/// Long real-time session against the real API, shaped like a meeting: speech segments
+/// arrive at their real times (end of speech + VAD redemption), with pauses in between.
+///   GEMINI_API_KEY=... MEETILY_GEMINI_TEST_PCM=clip.pcm MEETILY_GEMINI_TEST_SECS=240 \
+///     cargo test --lib gemini_live::tests::real_api_long -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "needs GEMINI_API_KEY and MEETILY_GEMINI_TEST_PCM; runs for minutes"]
+async fn real_api_long_session() {
+    let key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY");
+    let bytes = std::fs::read(std::env::var("MEETILY_GEMINI_TEST_PCM").expect("MEETILY_GEMINI_TEST_PCM")).unwrap();
+    let total: f64 = std::env::var("MEETILY_GEMINI_TEST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(240.0);
+    let pcm: Vec<i16> = bytes.chunks(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    let clip_secs = pcm.len() as f64 / 16000.0;
+    let segments = split_on_silence(&pcm);
+    let on_status: StatusCallback = Arc::new(|s: GeminiLiveStatus| println!("    STATUS {}: {}", s.kind, s.message));
+    let provider = GeminiLiveProvider::new(vec![key], super::settings::GeminiLiveSettings::default().setup_options(), Backup::HoldAndRetry, on_status);
+
+    let start = tokio::time::Instant::now();
+    let (mut timeline, mut empty_in_a_row, mut n) = (0.0f64, 0, 0);
+    'outer: loop {
+        let mut offset = 0.0;
+        for segment in &segments {
+            let secs = segment.len() as f64 / 16000.0;
+            offset += secs + 0.4; // approximate pause between segments
+            let arrives = timeline + offset + 0.5; // VAD redemption
+            if arrives > total {
+                break 'outer;
+            }
+            tokio::time::sleep_until(start + Duration::from_secs_f64(arrives)).await;
+            let t0 = std::time::Instant::now();
+            let text = provider.transcribe(segment.clone(), None).await.expect("transcribe").text;
+            n += 1;
+            empty_in_a_row = if text.is_empty() { empty_in_a_row + 1 } else { 0 };
+            println!(
+                "[{:6.1}s] seg {:3} ({:.1}s audio, {:.2}s wall) {}",
+                start.elapsed().as_secs_f64(),
+                n,
+                secs,
+                t0.elapsed().as_secs_f64(),
+                if text.is_empty() { "<EMPTY>".to_string() } else { text.chars().take(60).collect() }
+            );
+        }
+        timeline += clip_secs + 1.5;
+    }
+    println!("segments: {}, trailing empty results: {}", n, empty_in_a_row);
+    assert!(empty_in_a_row < 3, "transcription stopped producing text");
 }

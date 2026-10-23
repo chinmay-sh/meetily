@@ -24,7 +24,7 @@ export interface GeminiLiveSettingsView extends GeminiLiveSettings {
 }
 
 export interface GeminiLiveStatus {
-  kind: 'key_switch' | 'outage' | 'recovered' | 'gave_up' | 'fallback' | 'resumed' | 'disabled';
+  kind: 'key_switch' | 'outage' | 'recovered' | 'gave_up' | 'skipped' | 'fallback' | 'resumed' | 'disabled';
   message: string;
 }
 
@@ -49,6 +49,9 @@ export const moveGeminiApiKey = (index: number, toIndex: number) =>
 /** Test a pasted key, the saved key at `index`, or (neither) the key that would be used. */
 export const testGeminiLiveConnection = (apiKey: string | null, index: number | null = null) =>
   invoke<string>('gemini_live_test_connection', { apiKey, index });
+
+/** Open the folder with gemini-live.log; resolves to the log file path. */
+export const openGeminiLiveLogFolder = () => invoke<string>('gemini_live_open_log_folder');
 
 /** Make Gemini Live the active transcription engine. */
 export const activateGeminiLive = () =>
