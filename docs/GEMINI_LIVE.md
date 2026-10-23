@@ -38,12 +38,13 @@ the app will not "update" itself back to official Meetily.
 
 ## Turn on Gemini Live in the app
 
-**During first-run setup** (no model downloads): on the "Getting things ready" step, click
-**"Don't want to download models? Use Gemini cloud transcription instead"**, paste your key
-and click **Test & add** (add more keys from other accounts if you have them), then
-**Use Gemini and skip downloads** → **Continue**. Parakeet and the summary model are not
-downloaded. For summaries, choose a cloud provider (Claude, OpenAI, Groq or OpenRouter) in
-**Settings → Summary**, or download the built-in model there later.
+**During first-run setup** (no model downloads): the "Getting things ready" step asks how
+Meetily should transcribe; nothing downloads until you choose. Click **Gemini Live cloud
+transcription (no downloads)**, paste your key and click **Test & add** (add more keys from
+other accounts if you have them), then **Use Gemini and skip downloads** → **Continue**.
+Choosing **Download local models** instead starts the usual Parakeet and summary model
+downloads. For summaries without the built-in model, choose a cloud provider (Claude, OpenAI,
+Groq or OpenRouter) in **Settings → Summary**, or download the built-in model there later.
 
 **Later, from Settings:** open **Settings → Transcription**, choose
 **☁️ Gemini Live (Cloud - Hindi + English)** in **Transcript Model**, then:
@@ -73,8 +74,12 @@ Click **Save and use Gemini Live**.
   words are removed.
 - **Several keys**: if the key in use fails for any reason (rate limit, quota, invalid key,
   server or network error), the same sentence is retried right away with the next key, and the
-  app stays on the key that works. A rejected key is skipped for the rest of the recording;
-  other failures make a key "last choice" for a minute.
+  app stays on the key that works.
+  - A key that hits its **rate limit or quota** is paused for **5 minutes**, then becomes
+    available again. If every key is paused, the one whose pause ends soonest is tried first,
+    so with two keys a rate-limited second key hands back to the first.
+  - Other errors (network, server) pause a key for 1 minute.
+  - An **invalid key** is skipped for the rest of the recording.
 - **When every key fails**:
   - *Cloud only*: untranscribed audio is held and retried (every 2–30 s) until Gemini answers,
     then the transcript catches up in order with correct timestamps. If Gemini is still

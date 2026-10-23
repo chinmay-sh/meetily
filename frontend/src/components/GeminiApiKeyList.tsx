@@ -121,8 +121,9 @@ export function GeminiApiKeyList({ view, onChange }: GeminiApiKeyListProps) {
         {keys.length === 0 && view.hasSummaryApiKey
           ? 'No key here yet: the Gemini key from your summary settings will be used. '
           : ''}
-        Keys are used in order. If the key in use fails (rate limit, quota, invalid key or any other
-        error), the next one takes over immediately. Get keys at aistudio.google.com.
+        Keys are used in order. If the key in use fails, the next one takes over immediately. A key
+        that hits its rate limit or quota is paused for 5 minutes and then used again; an invalid key
+        is skipped for the rest of the meeting. Get keys at aistudio.google.com.
       </p>
     </div>
   );

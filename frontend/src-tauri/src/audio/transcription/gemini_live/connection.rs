@@ -37,6 +37,8 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub enum LiveError {
     /// Retrying will not help (invalid or missing API key, rejected setup).
     Auth(String),
+    /// The key hit a rate limit or quota (e.g. tokens per minute); it works again later.
+    RateLimited(String),
     /// Network errors, timeouts, server-side closes.
     Transient(String),
 }
@@ -45,6 +47,7 @@ impl std::fmt::Display for LiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auth(m) => write!(f, "Gemini rejected the request: {}", m),
+            Self::RateLimited(m) => write!(f, "Gemini rate limit or quota reached: {}", m),
             Self::Transient(m) => write!(f, "Gemini connection problem: {}", m),
         }
     }
@@ -58,7 +61,10 @@ fn classify_close(code: Option<u16>, reason: &str, during_setup: bool) -> LiveEr
         Some(c) => format!("connection closed ({}): {}", c, reason),
         None => format!("connection closed: {}", reason),
     };
-    if during_setup && protocol::is_permanent_close(code) {
+    // Checked first: a quota close must pause the key, never disable it like a bad key.
+    if is_rate_limit(reason) {
+        LiveError::RateLimited(msg)
+    } else if during_setup && protocol::is_permanent_close(code) {
         LiveError::Auth(msg)
     } else {
         LiveError::Transient(msg)
@@ -318,6 +324,15 @@ impl Drop for LiveConnection {
     }
 }
 
+/// Google reports rate limits and exhausted quotas (requests/tokens per minute, per day)
+/// as RESOURCE_EXHAUSTED / HTTP 429 with "quota" or "rate limit" wording.
+fn is_rate_limit(text: &str) -> bool {
+    let text = text.to_lowercase();
+    ["resource_exhausted", "resource exhausted", "quota", "rate limit", "rate-limit", "ratelimit", "too many requests"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
 fn handshake_error(e: tokio_tungstenite::tungstenite::Error) -> LiveError {
     use tokio_tungstenite::tungstenite::Error;
     match e {
@@ -329,7 +344,9 @@ fn handshake_error(e: tokio_tungstenite::tungstenite::Error) -> LiveError {
                 .map(|b| String::from_utf8_lossy(b).chars().take(200).collect::<String>())
                 .unwrap_or_default();
             let msg = format!("HTTP {} during WebSocket handshake {}", status, body);
-            if status == 400 || status == 401 || status == 403 {
+            if status == 429 || is_rate_limit(&body) {
+                LiveError::RateLimited(msg)
+            } else if status == 400 || status == 401 || status == 403 {
                 LiveError::Auth(msg)
             } else {
                 LiveError::Transient(msg)
@@ -405,6 +422,16 @@ mod tests {
         // The server closes with 1008 ~50 s after goAway; that is a normal session end.
         assert!(matches!(classify_close(Some(1008), "failed to close after GoAway", false), LiveError::Transient(_)));
         assert!(matches!(classify_close(Some(1011), "internal", true), LiveError::Transient(_)));
+    }
+
+    #[test]
+    fn rate_limits_are_recognised() {
+        let quota = "RESOURCE_EXHAUSTED: Quota exceeded for metric: generate_content_input_token_count per minute";
+        assert!(matches!(classify_close(Some(1011), quota, false), LiveError::RateLimited(_)));
+        // Even with a code that would otherwise mean "bad key".
+        assert!(matches!(classify_close(Some(1008), "You exceeded your current quota", true), LiveError::RateLimited(_)));
+        assert!(matches!(classify_close(Some(1013), "Too Many Requests", false), LiveError::RateLimited(_)));
+        assert!(!is_rate_limit("Deadline exceeded"));
     }
 
     #[test]

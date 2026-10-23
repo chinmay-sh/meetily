@@ -12,8 +12,10 @@
 //   failed attempt is discarded, so nothing is emitted twice.
 // - Keys are tried in order. When the key in use fails for any reason, the same segment
 //   is retried immediately with the next key. Rejected keys (invalid/missing) are skipped
-//   for the rest of the recording; keys with other errors (rate limits, quota, network)
-//   are tried last for KEY_COOLDOWN.
+//   for the rest of the recording. A key that hits a rate limit or quota is paused for
+//   RATE_LIMIT_COOLDOWN and other failing keys for KEY_COOLDOWN; paused keys are only used
+//   when no other key is available, soonest-to-recover first, so with two keys a limited
+//   second key hands back to the first.
 // - When every key fails:
 //   - Backup::Local: the segment is transcribed by the local engine;
 //     MAX_CONSECUTIVE_FAILURES in a row pause Gemini for LOCAL_COOLDOWN.
@@ -36,6 +38,7 @@ const ROTATE_AFTER: Duration = Duration::from_secs(8 * 60 + 30);
 const PRIME_SECS: f64 = 2.0;
 const MIN_PRIME_SAMPLES: usize = 8000; // 0.5 s
 const KEY_COOLDOWN: Duration = Duration::from_secs(60);
+const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const LOCAL_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
@@ -189,7 +192,7 @@ impl GeminiLiveProvider {
         if st.had_connection && st.tail_audio.len() >= MIN_PRIME_SAMPLES {
             match fresh.transcribe_segment(&st.tail_audio, PACE_FACTOR).await {
                 Ok(_) => st.dedup_next = true,
-                Err(LiveError::Auth(m)) => return Err(LiveError::Auth(m)),
+                Err(e @ (LiveError::Auth(_) | LiveError::RateLimited(_))) => return Err(e),
                 Err(e) => warn!("Gemini Live: priming new session failed ({}); continuing without overlap", e),
             }
         }
@@ -230,7 +233,10 @@ impl GeminiLiveProvider {
                     st.tail_audio = audio[audio.len().saturating_sub(keep)..].to_vec();
                     return Ok(text);
                 }
-                Err(LiveError::Auth(m)) => return Err(LiveError::Auth(m)),
+                Err(e @ (LiveError::Auth(_) | LiveError::RateLimited(_))) => {
+                    st.conn = None;
+                    return Err(e);
+                }
                 Err(e) => {
                     warn!("Gemini Live: segment attempt {} failed on key #{}: {}", attempt + 1, st.current + 1, e);
                     st.conn = None;
@@ -248,7 +254,8 @@ impl GeminiLiveProvider {
         let now = Instant::now();
         let n = self.api_keys.len();
         let mut order: Vec<usize> = (0..n).map(|i| (st.current + i) % n).filter(|&i| !st.keys[i].rejected).collect();
-        order.sort_by_key(|&i| st.keys[i].cooling_until.map_or(false, |t| t > now));
+        // Available keys first (current one first); then paused keys, soonest to recover first.
+        order.sort_by_key(|&i| st.keys[i].cooling_until.filter(|&t| t > now));
 
         let mut last_error = String::from("no usable API key");
         let mut previous_failure: Option<String> = None;
@@ -281,6 +288,12 @@ impl GeminiLiveProvider {
                     warn!("Gemini Live: key #{} rejected: {}", i + 1, m);
                     st.keys[i].rejected = true;
                     previous_failure = Some(m.clone());
+                    last_error = m;
+                }
+                Err(LiveError::RateLimited(m)) => {
+                    warn!("Gemini Live: key #{} rate limited; pausing it for {} minutes: {}", i + 1, RATE_LIMIT_COOLDOWN.as_secs() / 60, m);
+                    st.keys[i].cooling_until = Some(Instant::now() + RATE_LIMIT_COOLDOWN);
+                    previous_failure = Some(format!("rate limit reached, paused for {} minutes", RATE_LIMIT_COOLDOWN.as_secs() / 60));
                     last_error = m;
                 }
                 Err(LiveError::Transient(m)) => {

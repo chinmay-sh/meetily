@@ -34,6 +34,8 @@ struct ConnPlan {
     go_away_after_segments: Option<usize>,
     /// Never report speech or send finals (non-speech audio).
     silent: bool,
+    /// Close with a quota error when audio for this segment index starts.
+    rate_limit_on_segment: Option<usize>,
 }
 
 #[derive(Default)]
@@ -95,6 +97,15 @@ async fn serve(tcp: tokio::net::TcpStream, idx: usize, plan: Plan, reply: Reply,
             }
             ws.send(text(r#"{"setupComplete":{}}"#.into())).await.unwrap();
         } else if let Some(data) = v.pointer("/realtimeInput/audio/data").and_then(Value::as_str) {
+            if plan.rate_limit_on_segment == Some(segment) {
+                let _ = ws
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::from(1011),
+                        reason: "RESOURCE_EXHAUSTED: Quota exceeded for metric: input tokens per minute".into(),
+                    })))
+                    .await;
+                return;
+            }
             frames += 1;
             samples += base64::engine::general_purpose::STANDARD.decode(data).unwrap().len() / 2;
             if plan.drop_after_frames == Some(frames) {
@@ -373,6 +384,29 @@ async fn cloud_only_stops_when_every_key_is_rejected() {
     let before = h.connections();
     assert_eq!(h.say(0.5).await, "");
     assert_eq!(h.connections(), before);
+}
+
+#[tokio::test]
+async fn rate_limited_keys_pause_and_hand_back_to_each_other() {
+    // Key "a" is rate limited on its first segment; "b" works for one segment, then is
+    // rate limited too. Both are paused, so the one paused first ("a") is tried again.
+    let h = Harness::build(
+        vec!["a", "b"],
+        Mode::CloudOnly,
+        |idx, key| match (idx, key) {
+            (0, "a") => ConnPlan { rate_limit_on_segment: Some(0), ..Default::default() },
+            (_, "b") => ConnPlan { rate_limit_on_segment: Some(1), ..Default::default() },
+            _ => ConnPlan::default(),
+        },
+        |conn, seg| format!("c{}s{}", conn, seg),
+    )
+    .await;
+    assert_eq!(h.say(0.5).await, "c1s0", "key b takes over immediately");
+    // On key a's new session, segment 0 is the 0.5 s overlap primer; 1 is the real one.
+    assert_eq!(h.say(0.5).await, "c2s1", "back to key a once b is limited too");
+    // A rate-limited key is not retried on a fresh session before moving on.
+    assert_eq!(*h.stats.keys.lock().unwrap(), vec!["a", "b", "a"]);
+    assert_eq!(h.statuses(), vec!["key_switch", "key_switch"]);
 }
 
 /// Split s16le PCM into speech segments on 300 ms pauses, like the app's VAD output.

@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Mic, Sparkles, Check, Loader2, Download } from 'lucide-react';
+import { Mic, Sparkles, Check, Loader2, Download, HardDrive } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { OnboardingContainer } from '../OnboardingContainer';
 import { useOnboarding } from '@/contexts/OnboardingContext';
@@ -39,6 +39,8 @@ export function DownloadProgressStep() {
   } = useOnboarding();
 
   const [isMac, setIsMac] = useState(false);
+  // Fork addition: nothing downloads until the user picks local models (vs. Gemini cloud).
+  const [localModelsChosen, setLocalModelsChosen] = useState(false);
 
   const [parakeetState, setParakeetState] = useState<DownloadState>({
     status: parakeetDownloaded ? 'completed' : 'waiting',
@@ -169,6 +171,7 @@ export function DownloadProgressStep() {
 
   // Start the required transcription model immediately; summary readiness must not block it.
   useEffect(() => {
+    if (!localModelsChosen) return;
     if (parakeetDownloadStartedRef.current) return;
     parakeetDownloadStartedRef.current = true;
 
@@ -185,16 +188,17 @@ export function DownloadProgressStep() {
         setParakeetState((prev) => ({ ...prev, status: 'error', error: String(error) }));
       }
     });
-  }, []);
+  }, [localModelsChosen]);
 
   // Start the selected summary model only after the backend recommendation is known.
   useEffect(() => {
+    if (!localModelsChosen) return;
     if (summaryDownloadStartedRef.current) return;
     if (!selectedSummaryModel) return;
     summaryDownloadStartedRef.current = true;
 
     startSummaryDownload();
-  }, [selectedSummaryModel]);
+  }, [selectedSummaryModel, localModelsChosen]);
 
   // Listen to Parakeet download progress
   useEffect(() => {
@@ -493,13 +497,36 @@ export function DownloadProgressStep() {
   return (
     <OnboardingContainer
       title="Getting things ready"
-      description="You can start using Meetily after downloading the Transcription Engine."
+      description={
+        localModelsChosen || cloudTranscription
+          ? 'You can start using Meetily after downloading the Transcription Engine.'
+          : 'Choose how Meetily transcribes your meetings. Nothing is downloaded until you choose.'
+      }
       step={3}
       totalSteps={isMac ? 4 : 3}
     >
       <div className="flex flex-col items-center space-y-6">
         {/* Download Cards */}
-        {!cloudTranscription && <div className="w-full max-w-lg space-y-4">
+        {!cloudTranscription && !localModelsChosen && (
+          <div className="w-full max-w-lg space-y-3">
+            <GeminiCloudSetup variant="option" />
+            <button
+              type="button"
+              onClick={() => setLocalModelsChosen(true)}
+              className="w-full text-left rounded-xl border border-gray-200 bg-white p-5 hover:border-gray-400 transition-colors"
+            >
+              <p className="font-medium text-gray-900 flex items-center gap-2">
+                <HardDrive className="w-4 h-4" /> Download local models
+              </p>
+              <p className="text-sm text-gray-600 mt-1">
+                Private, offline transcription and summaries on this computer. Downloads the
+                transcription engine (~670 MB) and a summary model.
+              </p>
+            </button>
+          </div>
+        )}
+
+        {!cloudTranscription && localModelsChosen && <div className="w-full max-w-lg space-y-4">
           {renderDownloadCard(
             'Transcription Engine',
             <Mic className="w-5 h-5 text-gray-600" />,
@@ -516,7 +543,7 @@ export function DownloadProgressStep() {
           )}
         </div>}
 
-        <GeminiCloudSetup />
+        {(cloudTranscription || localModelsChosen) && <GeminiCloudSetup />}
 
         {/* Info Message - Only show when Parakeet is downloaded */}
         <AnimatePresence>
@@ -548,7 +575,7 @@ export function DownloadProgressStep() {
             disabled={(!parakeetDownloaded && !cloudTranscription) || isCompleting}
             className="w-full h-11 bg-gray-900 hover:bg-gray-800 text-white disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {(isCompleting || (!parakeetDownloaded && !cloudTranscription)) ? (
+            {(isCompleting || (localModelsChosen && !parakeetDownloaded && !cloudTranscription)) ? (
               <Loader2 className="w-4 h-4 mr-2 animate-spin" />
             ) : (
               'Continue'
