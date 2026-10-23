@@ -16,7 +16,12 @@ import {
 
 const PARAKEET_MODEL = 'parakeet-tdt-0.6b-v3-int8';
 
-export function GeminiCloudSetup() {
+interface GeminiCloudSetupProps {
+  /** "option": a choice card on the setup screen; "link": a small link under the downloads. */
+  variant?: 'option' | 'link';
+}
+
+export function GeminiCloudSetup({ variant = 'link' }: GeminiCloudSetupProps) {
   const { cloudTranscription, setCloudTranscription, selectedSummaryModel } = useOnboarding();
   const [open, setOpen] = useState(false);
   const [view, setView] = useState<GeminiLiveSettingsView | null>(null);
@@ -44,6 +49,24 @@ export function GeminiCloudSetup() {
     );
   }
 
+  if (!open && variant === 'option') {
+    return (
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className="w-full text-left rounded-xl border border-gray-200 bg-white p-5 hover:border-gray-400 transition-colors"
+      >
+        <p className="font-medium text-gray-900 flex items-center gap-2">
+          <Cloud className="w-4 h-4" /> Gemini Live cloud transcription (no downloads)
+        </p>
+        <p className="text-sm text-gray-600 mt-1">
+          Hindi + English transcription by Google Gemini with your API key(s). Nothing is downloaded;
+          meeting audio is sent to Google.
+        </p>
+      </button>
+    );
+  }
+
   if (!open) {
     return (
       <button type="button" className="text-sm text-blue-600 hover:underline" onClick={() => setOpen(true)}>
@@ -62,7 +85,7 @@ export function GeminiCloudSetup() {
         transcriptionMode: view.transcriptionMode,
         fallbackProvider: CLOUD_ONLY,
       });
-      // Stop the local model downloads started by this step.
+      // Stop local model downloads, if the user had started them.
       await invoke('parakeet_cancel_download', { modelName: PARAKEET_MODEL }).catch(() => {});
       if (selectedSummaryModel) {
         await invoke('builtin_ai_cancel_download', { modelName: selectedSummaryModel }).catch(() => {});

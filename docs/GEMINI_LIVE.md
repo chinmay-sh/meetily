@@ -38,12 +38,13 @@ the app will not "update" itself back to official Meetily.
 
 ## Turn on Gemini Live in the app
 
-**During first-run setup** (no model downloads): on the "Getting things ready" step, click
-**"Don't want to download models? Use Gemini cloud transcription instead"**, paste your key
-and click **Test & add** (add more keys from other accounts if you have them), then
-**Use Gemini and skip downloads** → **Continue**. Parakeet and the summary model are not
-downloaded. For summaries, choose a cloud provider (Claude, OpenAI, Groq or OpenRouter) in
-**Settings → Summary**, or download the built-in model there later.
+**During first-run setup** (no model downloads): the "Getting things ready" step asks how
+Meetily should transcribe; nothing downloads until you choose. Click **Gemini Live cloud
+transcription (no downloads)**, paste your key and click **Test & add** (add more keys from
+other accounts if you have them), then **Use Gemini and skip downloads** → **Continue**.
+Choosing **Download local models** instead starts the usual Parakeet and summary model
+downloads. For summaries without the built-in model, choose a cloud provider (Claude, OpenAI,
+Groq or OpenRouter) in **Settings → Summary**, or download the built-in model there later.
 
 **Later, from Settings:** open **Settings → Transcription**, choose
 **☁️ Gemini Live (Cloud - Hindi + English)** in **Transcript Model**, then:
