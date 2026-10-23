@@ -73,8 +73,12 @@ Click **Save and use Gemini Live**.
   words are removed.
 - **Several keys**: if the key in use fails for any reason (rate limit, quota, invalid key,
   server or network error), the same sentence is retried right away with the next key, and the
-  app stays on the key that works. A rejected key is skipped for the rest of the recording;
-  other failures make a key "last choice" for a minute.
+  app stays on the key that works.
+  - A key that hits its **rate limit or quota** is paused for **5 minutes**, then becomes
+    available again. If every key is paused, the one whose pause ends soonest is tried first,
+    so with two keys a rate-limited second key hands back to the first.
+  - Other errors (network, server) pause a key for 1 minute.
+  - An **invalid key** is skipped for the rest of the recording.
 - **When every key fails**:
   - *Cloud only*: untranscribed audio is held and retried (every 2–30 s) until Gemini answers,
     then the transcript catches up in order with correct timestamps. If Gemini is still
