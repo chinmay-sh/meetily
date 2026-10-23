@@ -88,7 +88,15 @@ Click **Save and use Gemini Live**.
     for that recording.
   - *Local engine*: the sentence is transcribed by Parakeet/Whisper on your computer; after 3
     failures in a row the local engine is used for 5 minutes, then Gemini is tried again.
-- A notification appears for key switches, outages, recovery and fallback.
+- Each speech segment is marked with explicit start/end signals, and Gemini confirms every
+  segment. If a confirmation doesn't arrive within ~15 s, the segment is resent on a fresh
+  session; if it still gets no answer, it is skipped (with a notice) so later speech keeps
+  being transcribed.
+- A notification appears for key switches, outages, recovery, skipped segments and fallback.
+- **Diagnostics log**: Settings → Transcription → Gemini Live → *Open diagnostics log folder*
+  (Windows: `%LOCALAPPDATA%\com.meetily.ai\logs\gemini-live.log`). It records sessions,
+  per-segment timings and errors, never API keys or transcript text. Send it along when
+  reporting a problem.
 - Known quirk: in Roman mode, a very short isolated phrase can occasionally come back in
   Devanagari.
 

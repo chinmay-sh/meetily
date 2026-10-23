@@ -729,6 +729,7 @@ pub fn run() {
             audio::transcription::gemini_live::commands::gemini_live_add_api_key,
             audio::transcription::gemini_live::commands::gemini_live_remove_api_key,
             audio::transcription::gemini_live::commands::gemini_live_move_api_key,
+            audio::transcription::gemini_live::commands::gemini_live_open_log_folder,
             audio::transcription::gemini_live::commands::gemini_live_test_connection,
             api::api_get_transcript_api_key,
             api::api_delete_meeting,

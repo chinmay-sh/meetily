@@ -7,6 +7,7 @@
 pub mod commands;
 pub mod connection;
 pub mod dedup;
+pub mod diag;
 pub mod pcm;
 pub mod protocol;
 pub mod provider;
@@ -115,6 +116,22 @@ pub async fn build_engine<R: Runtime>(app: &AppHandle<R>) -> Result<Transcriptio
         Backup::HoldAndRetry
     };
 
+    match log_dir(app) {
+        Ok(dir) => match diag::init(&dir) {
+            Ok(path) => info!("Gemini Live diagnostics log: {}", path.display()),
+            Err(e) => warn!("Gemini Live: could not open diagnostics log: {}", e),
+        },
+        Err(e) => warn!("Gemini Live: no log directory: {}", e),
+    }
+    crate::gemini_diag!(
+        "recording started: {} key(s), backup {}, language {}, {} vocabulary terms, mode {}",
+        api_keys.len(),
+        settings.fallback_provider,
+        settings.language_mode,
+        settings.custom_vocabulary.len(),
+        settings.transcription_mode
+    );
+
     let status_app = app.clone();
     let on_status: StatusCallback = Arc::new(move |status: GeminiLiveStatus| {
         let _ = status_app.emit("gemini-live-status", &status);
@@ -133,8 +150,14 @@ pub async fn build_engine<R: Runtime>(app: &AppHandle<R>) -> Result<Transcriptio
     Ok(TranscriptionEngine::Provider(Arc::new(provider)))
 }
 
+/// Folder holding the diagnostics log (Windows: %LOCALAPPDATA%\com.meetily.ai\logs).
+pub fn log_dir<R: Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, String> {
+    app.path().app_log_dir().map_err(|e| e.to_string())
+}
+
 /// Called from the stop path: free the local backup model, if one is used.
 pub async fn unload_fallback_engine<R: Runtime>(app: &AppHandle<R>) {
+    crate::gemini_diag!("recording stopped");
     let fallback_provider = settings::load(&pool(app))
         .await
         .map(|(s, _)| s.fallback_provider)

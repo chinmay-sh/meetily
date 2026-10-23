@@ -23,7 +23,7 @@
 //     while later segments queue up behind it, so the transcript catches up when Gemini
 //     returns. After the recording stops, retrying gives up after RetryPolicy::after_stop.
 
-use super::connection::{LiveConnection, LiveError, PACE_FACTOR};
+use super::connection::{LiveConnection, LiveError, DEFAULT_REPLY_TIMEOUT, PACE_FACTOR};
 use super::dedup::trim_overlap;
 use super::protocol::{SetupOptions, MODEL};
 use crate::audio::transcription::provider::{TranscriptionError, TranscriptionProvider, TranscriptResult};
@@ -83,6 +83,9 @@ enum KeysError {
     AllRejected(String),
     /// At least one key failed for a reason that may go away (network, quota, server).
     Failed(String),
+    /// Sessions connect, but no transcription came back for this segment even on a fresh
+    /// session. Not a key problem, so other keys are not tried.
+    NoResponse(String),
 }
 
 #[derive(Default, Clone)]
@@ -107,6 +110,7 @@ struct State {
     paused_until: Option<Instant>,
     rejected_notified: bool,
     // Backup::HoldAndRetry
+    skipped_in_a_row: u32,
     outage_since: Option<Instant>,
     stopped_at: Option<Instant>,
     gave_up: bool,
@@ -118,6 +122,7 @@ pub struct GeminiLiveProvider {
     setup: SetupOptions,
     backup: Backup,
     retry: RetryPolicy,
+    reply_timeout: Duration,
     is_live: LiveCheck,
     on_status: StatusCallback,
     state: Mutex<State>,
@@ -137,6 +142,7 @@ impl GeminiLiveProvider {
             setup,
             backup,
             retry: RetryPolicy::default(),
+            reply_timeout: DEFAULT_REPLY_TIMEOUT,
             is_live: Arc::new(|| true),
             on_status,
             state: Mutex::new(state),
@@ -153,6 +159,11 @@ impl GeminiLiveProvider {
         self
     }
 
+    pub fn with_reply_timeout(mut self, reply_timeout: Duration) -> Self {
+        self.reply_timeout = reply_timeout;
+        self
+    }
+
     pub fn with_live_check(mut self, is_live: LiveCheck) -> Self {
         self.is_live = is_live;
         self
@@ -160,6 +171,7 @@ impl GeminiLiveProvider {
 
     fn notify(&self, kind: &'static str, message: String) {
         info!("Gemini Live status [{}]: {}", kind, message);
+        crate::gemini_diag!("status [{}]: {}", kind, message);
         (self.on_status)(GeminiLiveStatus { kind, message });
     }
 
@@ -186,14 +198,25 @@ impl GeminiLiveProvider {
         if st.had_connection {
             info!("🔄 Gemini Live: opening new session ({}, key #{})", reason, st.current + 1);
         }
+        crate::gemini_diag!("opening session with key #{} ({})", st.current + 1, reason);
         // Make before break: the old session (if any) stays open until the new one is ready.
         let key = &self.api_keys[st.current];
-        let mut fresh = LiveConnection::connect_to(&self.endpoint, key, &self.setup).await?;
+        let mut fresh = LiveConnection::connect_to(&self.endpoint, key, &self.setup)
+            .await?
+            .with_reply_timeout(self.reply_timeout);
         if st.had_connection && st.tail_audio.len() >= MIN_PRIME_SAMPLES {
             match fresh.transcribe_segment(&st.tail_audio, PACE_FACTOR).await {
                 Ok(_) => st.dedup_next = true,
                 Err(e @ (LiveError::Auth(_) | LiveError::RateLimited(_))) => return Err(e),
-                Err(e) => warn!("Gemini Live: priming new session failed ({}); continuing without overlap", e),
+                Err(e) => {
+                    warn!("Gemini Live: priming new session failed ({}); continuing without overlap", e);
+                    if !fresh.check_usable() {
+                        // The primer stalled the session; start over without priming.
+                        fresh = LiveConnection::connect_to(&self.endpoint, key, &self.setup)
+                            .await?
+                            .with_reply_timeout(self.reply_timeout);
+                    }
+                }
             }
         }
         if let Some(mut old) = st.conn.replace(fresh) {
@@ -297,9 +320,14 @@ impl GeminiLiveProvider {
                     last_error = m;
                 }
                 Err(LiveError::Transient(m)) => {
+                    crate::gemini_diag!("key #{} failed: {}", i + 1, m);
                     st.keys[i].cooling_until = Some(Instant::now() + KEY_COOLDOWN);
                     previous_failure = Some(m.clone());
                     last_error = m;
+                }
+                Err(LiveError::NoResponse(m)) => {
+                    st.conn = None;
+                    return Err(KeysError::NoResponse(m));
                 }
             }
             st.conn = None;
@@ -341,7 +369,7 @@ impl GeminiLiveProvider {
                         );
                     }
                 }
-                Err(KeysError::Failed(msg)) => {
+                Err(KeysError::Failed(msg)) | Err(KeysError::NoResponse(msg)) => {
                     st.consecutive_failures += 1;
                     if st.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                         st.consecutive_failures = 0;
@@ -375,6 +403,7 @@ impl GeminiLiveProvider {
         loop {
             match self.transcribe_with_keys(&mut st, &audio).await {
                 Ok(text) => {
+                    st.skipped_in_a_row = 0;
                     if let Some(since) = st.outage_since.take() {
                         self.notify(
                             "recovered",
@@ -385,6 +414,22 @@ impl GeminiLiveProvider {
                         );
                     }
                     return Ok(TranscriptResult { text, confidence: None, is_partial: false });
+                }
+                Err(KeysError::NoResponse(msg)) => {
+                    // Retrying the same audio forever would block every later segment.
+                    st.skipped_in_a_row += 1;
+                    if st.skipped_in_a_row == 1 {
+                        self.notify(
+                            "skipped",
+                            format!(
+                                "Gemini didn't return text for {:.0}s of speech, even after reconnecting ({}). \
+                                 Skipped it so transcription keeps going.",
+                                audio.len() as f64 / 16000.0,
+                                msg
+                            ),
+                        );
+                    }
+                    return empty();
                 }
                 Err(KeysError::AllRejected(msg)) => {
                     st.gave_up = true;

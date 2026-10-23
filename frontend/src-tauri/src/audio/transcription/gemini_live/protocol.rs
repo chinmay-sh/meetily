@@ -3,9 +3,12 @@
 // JSON messages for the Gemini Live (BidiGenerateContent) WebSocket, limited to what
 // transcription needs. Behaviour notes below were verified against
 // gemini-3.5-transcribe-live:
-// - each `audioStreamEnd` after a speech segment yields `inputTranscription` finals
-//   followed by `generationComplete`;
-// - a segment with no speech yields nothing at all (no voiceActivity, no finals);
+// - with automatic activity detection disabled, each segment sent between
+//   `activityStart` and `activityEnd` is acknowledged with ACTIVITY_START, then any
+//   `inputTranscription` finals and `generationComplete`, then ACTIVITY_END; a segment
+//   without speech gets only the two acknowledgements;
+// - with automatic detection, short utterances were often left unanswered after
+//   `audioStreamEnd` until more audio arrived (and sometimes dropped);
 // - auth failures close the socket during setup with 1007 (bad key) or 1008 (missing key);
 // - the server sends goAway (timeLeft "50s") at 9:00 and closes with 1008 at ~9:50;
 // - sessionResumption is accepted but no resumption handles are sent.
@@ -38,6 +41,8 @@ pub fn setup_message(opts: &SetupOptions) -> String {
             "model": format!("models/{}", MODEL),
             "generationConfig": { "responseModalities": ["TEXT"] },
             "inputAudioTranscription": transcription,
+            // Segment boundaries come from the app's VAD via activityStart/activityEnd.
+            "realtimeInputConfig": { "automaticActivityDetection": { "disabled": true } },
         }
     })
     .to_string()
@@ -55,8 +60,12 @@ pub fn audio_message(pcm_s16le: &[u8]) -> String {
     .to_string()
 }
 
-pub fn audio_stream_end_message() -> String {
-    json!({ "realtimeInput": { "audioStreamEnd": true } }).to_string()
+pub fn activity_start_message() -> String {
+    json!({ "realtimeInput": { "activityStart": {} } }).to_string()
+}
+
+pub fn activity_end_message() -> String {
+    json!({ "realtimeInput": { "activityEnd": {} } }).to_string()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +138,7 @@ mod tests {
         assert_eq!(v["setup"]["inputAudioTranscription"]["languageCodes"][0], "en-IN");
         assert_eq!(v["setup"]["inputAudioTranscription"]["customVocabulary"][0], "Meetily");
         assert_eq!(v["setup"]["inputAudioTranscription"]["mode"], "SMART");
+        assert_eq!(v["setup"]["realtimeInputConfig"]["automaticActivityDetection"]["disabled"], true);
     }
 
     #[test]

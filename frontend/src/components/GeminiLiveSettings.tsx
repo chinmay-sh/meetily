@@ -14,6 +14,7 @@ import {
   GeminiLiveSettingsView,
   getGeminiLiveSettings,
   MAX_VOCABULARY_TERMS,
+  openGeminiLiveLogFolder,
   saveGeminiLiveSettings,
 } from '@/lib/gemini-live';
 
@@ -166,6 +167,23 @@ export function GeminiLiveSettings({ isActive, onActivated }: GeminiLiveSettings
         </Button>
         {isActive && <span className="text-sm text-green-700">✓ Gemini Live is active</span>}
       </div>
+
+      <p className="mx-1 text-xs text-gray-500">
+        Problems during a recording?{' '}
+        <button
+          type="button"
+          className="text-blue-600 hover:underline"
+          onClick={() =>
+            openGeminiLiveLogFolder().catch((error) =>
+              toast.error('Could not open the log folder', { description: String(error) })
+            )
+          }
+        >
+          Open diagnostics log folder
+        </button>{' '}
+        and send <code>gemini-live.log</code> (it contains timings and errors, never your keys or
+        transcript text).
+      </p>
     </div>
   );
 }

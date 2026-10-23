@@ -133,3 +133,24 @@ pub async fn gemini_live_test_connection(
     conn.close_in_background();
     Ok(format!("Key …{} connected to {} successfully.", hint(&key), super::protocol::MODEL))
 }
+
+/// Open the folder containing the diagnostics log (`gemini-live.log`).
+#[tauri::command]
+pub async fn gemini_live_open_log_folder<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<String, String> {
+    let dir = super::log_dir(&app)?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create log folder: {}", e))?;
+    let folder = dir.to_string_lossy().to_string();
+
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let opener = "xdg-open";
+
+    std::process::Command::new(opener)
+        .arg(&folder)
+        .spawn()
+        .map_err(|e| format!("Failed to open folder: {}", e))?;
+    Ok(super::diag::path_in(&dir).to_string_lossy().to_string())
+}
