@@ -1,42 +1,54 @@
 'use client';
 
 // Meeting copilot (fork addition): a side panel that researches topics raised in the
-// live meeting with Gemini + Google Search, plus an Ask box for direct questions.
+// live meeting (web and allowed folders), plus an Ask box for direct questions.
 
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import ReactMarkdown from 'react-markdown';
-import { FileText, Folder, FolderPlus, Loader2, Send, Sparkles, X } from 'lucide-react';
+import { FileText, Folder, FolderPlus, Loader2, Send, Settings2, Sparkles, X } from 'lucide-react';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Transcript } from '@/types';
 import {
   CopilotCard,
+  CopilotEngine,
   CopilotPrefs,
+  CopilotSettings,
   DEFAULT_COPILOT_MODEL,
   addCopilotFolder,
   copilotResearch,
   getCopilotFolders,
+  getCopilotSettings,
+  listCopilotModels,
   loadCopilotPrefs,
   openCopilotFile,
   removeCopilotFolder,
   saveCopilotPrefs,
+  setTavilyKey,
 } from '@/lib/copilot';
 
 const AUTO_INTERVAL_MS = 20_000;
 const AUTO_CONTEXT_CHARS = 4_000; // roughly the last 3 minutes of speech
 const ASK_CONTEXT_CHARS = 12_000;
+/** Select item for "use the summary model" (Radix Select items cannot have an empty value). */
+const SUMMARY_MODEL_ITEM = '__summary_model__';
 
 type Entry = CopilotCard & { id: number; question?: string };
+type ReportError = (message: string | null) => void;
 
 const recentText = (transcripts: Transcript[], maxChars: number) =>
   transcripts.map(t => t.text.trim()).filter(Boolean).join('\n').slice(-maxChars);
 
 const openUrl = (url: string) =>
   invoke('open_external_url', { url }).catch(err => console.error('Failed to open link:', err));
+
+const modelFor = (prefs: CopilotPrefs) =>
+  prefs.engine === 'custom' ? prefs.customModel : prefs.model || DEFAULT_COPILOT_MODEL;
 
 export function MeetingCopilot() {
   const { transcripts } = useTranscripts();
@@ -47,7 +59,7 @@ export function MeetingCopilot() {
   const [asking, setAsking] = useState(false);
   const [question, setQuestion] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const [folders, setFolders] = useState<string[]>([]);
+  const [showSettings, setShowSettings] = useState(false);
 
   const transcriptsRef = useRef(transcripts);
   transcriptsRef.current = transcripts;
@@ -66,9 +78,6 @@ export function MeetingCopilot() {
       return next;
     });
 
-  const addEntry = (card: CopilotCard, asked?: string) =>
-    setEntries(prev => [{ ...card, id: nextId.current++, question: asked }, ...prev]);
-
   // A new recording starts with a clean panel (results are never stored).
   useEffect(() => {
     if (isRecording) {
@@ -80,21 +89,10 @@ export function MeetingCopilot() {
 
   const enabled = prefs?.enabled ?? false;
   const auto = prefs?.auto ?? false;
-  const model = prefs?.model || DEFAULT_COPILOT_MODEL;
+  const engine: CopilotEngine = prefs?.engine ?? 'gemini';
+  const model = prefs ? modelFor(prefs) : DEFAULT_COPILOT_MODEL;
 
-  useEffect(() => {
-    if (enabled) getCopilotFolders().then(setFolders).catch(e => setError(String(e)));
-  }, [enabled]);
-
-  const changeFolders = (change: Promise<string[]>) =>
-    change
-      .then(list => {
-        setFolders(list);
-        setError(null);
-      })
-      .catch(e => setError(String(e)));
-
-  // Auto mode: every interval, if new speech arrived, ask Gemini whether anything is worth looking up.
+  // Auto mode: every interval, if new speech arrived, ask whether anything is worth looking up.
   useEffect(() => {
     if (!enabled || !auto || !isRecording) return;
     let busy = false;
@@ -106,6 +104,7 @@ export function MeetingCopilot() {
       setResearching(true);
       try {
         const card = await copilotResearch({
+          engine,
           model,
           transcript: recentText(transcriptsRef.current, AUTO_CONTEXT_CHARS),
           covered: entriesRef.current.map(e => e.topic).filter(Boolean),
@@ -122,7 +121,7 @@ export function MeetingCopilot() {
       }
     }, AUTO_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [enabled, auto, model, isRecording]);
+  }, [enabled, auto, engine, model, isRecording]);
 
   const ask = async () => {
     const q = question.trim();
@@ -131,12 +130,13 @@ export function MeetingCopilot() {
     setError(null);
     try {
       const card = await copilotResearch({
+        engine,
         model,
         transcript: recentText(transcriptsRef.current, ASK_CONTEXT_CHARS),
         covered: [],
         question: q,
       });
-      if (card) addEntry(card, q);
+      if (card) setEntries(prev => [{ ...card, id: nextId.current++, question: q }, ...prev]);
       setQuestion('');
     } catch (e) {
       setError(String(e));
@@ -153,7 +153,7 @@ export function MeetingCopilot() {
         <Button
           variant="ghost"
           size="icon"
-          title="Meeting copilot: live web research"
+          title="Meeting copilot: live research from the web and your files"
           aria-label="Open meeting copilot"
           onClick={() => updatePrefs({ enabled: true })}
         >
@@ -165,7 +165,7 @@ export function MeetingCopilot() {
 
   return (
     <aside className="w-96 shrink-0 border-l border-gray-200 bg-white flex flex-col" aria-label="Meeting copilot">
-      <div className="p-4 border-b border-gray-200 space-y-3">
+      <div className="p-4 border-b border-gray-200 space-y-3 max-h-[70%] overflow-y-auto">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2 font-medium text-gray-900">
             <Sparkles className="h-4 w-4" />
@@ -174,15 +174,27 @@ export function MeetingCopilot() {
               <Loader2 className="h-4 w-4 animate-spin text-gray-400" aria-label="Researching" />
             )}
           </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            title="Turn off copilot"
-            aria-label="Turn off copilot"
-            onClick={() => updatePrefs({ enabled: false })}
-          >
-            <X />
-          </Button>
+          <div className="flex items-center">
+            <Button
+              variant={showSettings ? 'secondary' : 'ghost'}
+              size="icon"
+              title="Copilot settings"
+              aria-label="Copilot settings"
+              aria-expanded={showSettings}
+              onClick={() => setShowSettings(v => !v)}
+            >
+              <Settings2 />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Turn off copilot"
+              aria-label="Turn off copilot"
+              onClick={() => updatePrefs({ enabled: false })}
+            >
+              <X />
+            </Button>
+          </div>
         </div>
         <label className="flex items-center justify-between gap-3 text-sm text-gray-700">
           Research topics automatically while recording
@@ -207,10 +219,12 @@ export function MeetingCopilot() {
           </Button>
         </form>
         <p className="text-xs text-gray-500">
-          Sends the recent transcript, and text from any allowed files it reads, to Google Gemini
-          using your Gemini API keys.
+          {prefs.engine === 'custom'
+            ? 'Sends the recent transcript, and text from any allowed files it reads, to your custom model endpoint, and search queries to Tavily.'
+            : 'Sends the recent transcript, and text from any allowed files it reads, to Google Gemini using your Gemini API keys.'}
         </p>
         {error && <p className="text-xs text-red-600 break-words">{error}</p>}
+        {showSettings && <SettingsSection prefs={prefs} updatePrefs={updatePrefs} onError={setError} />}
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 pb-32 space-y-3">
@@ -225,16 +239,153 @@ export function MeetingCopilot() {
           <CopilotEntry key={entry.id} entry={entry} />
         ))}
       </div>
+    </aside>
+  );
+}
 
-      <div className="border-t border-gray-200 p-3 space-y-2 text-xs text-gray-500">
+function SettingsSection({
+  prefs,
+  updatePrefs,
+  onError,
+}: {
+  prefs: CopilotPrefs;
+  updatePrefs: (change: Partial<CopilotPrefs>) => void;
+  onError: ReportError;
+}) {
+  const [settings, setSettings] = useState<CopilotSettings | null>(null);
+  const [models, setModels] = useState<string[]>([]);
+  const [folders, setFolders] = useState<string[]>([]);
+  const [tavilyInput, setTavilyInput] = useState('');
+
+  useEffect(() => {
+    getCopilotSettings().then(setSettings).catch(e => onError(String(e)));
+    getCopilotFolders().then(setFolders).catch(e => onError(String(e)));
+  }, [onError]);
+
+  useEffect(() => {
+    if (prefs.engine === 'custom') listCopilotModels().then(setModels).catch(e => onError(String(e)));
+  }, [prefs.engine, onError]);
+
+  const changeFolders = (change: Promise<string[]>) =>
+    change
+      .then(list => {
+        setFolders(list);
+        onError(null);
+      })
+      .catch(e => onError(String(e)));
+
+  const saveTavilyKey = (key: string) =>
+    setTavilyKey(key)
+      .then(next => {
+        setSettings(next);
+        setTavilyInput('');
+        onError(null);
+      })
+      .catch(e => onError(String(e)));
+
+  // Keep a saved model selectable even if the endpoint's list could not be loaded.
+  const modelOptions =
+    prefs.customModel && !models.includes(prefs.customModel) ? [prefs.customModel, ...models] : models;
+
+  return (
+    <div className="space-y-3 border-t border-gray-200 pt-3 text-xs text-gray-600">
+      <div className="space-y-1">
+        <span className="font-medium text-gray-700">Engine</span>
+        <Select value={prefs.engine} onValueChange={value => updatePrefs({ engine: value as CopilotEngine })}>
+          <SelectTrigger className="h-8 text-xs" aria-label="Copilot engine">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="gemini">Gemini + Google Search</SelectItem>
+            <SelectItem value="custom">Custom model (summary endpoint)</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      {prefs.engine === 'gemini' ? (
+        <div className="flex items-center gap-2">
+          Model
+          <Input
+            className="h-7 text-xs"
+            defaultValue={prefs.model}
+            aria-label="Copilot Gemini model"
+            onBlur={e => updatePrefs({ model: e.target.value.trim() || DEFAULT_COPILOT_MODEL })}
+          />
+        </div>
+      ) : (
+        <>
+          {settings && !settings.customDefaultModel && (
+            <p className="text-amber-700">Set up a custom OpenAI-compatible model in Settings → Summary first.</p>
+          )}
+          <div className="space-y-1">
+            <span className="font-medium text-gray-700">Model</span>
+            <Select
+              value={prefs.customModel || SUMMARY_MODEL_ITEM}
+              onValueChange={value => updatePrefs({ customModel: value === SUMMARY_MODEL_ITEM ? '' : value })}
+            >
+              <SelectTrigger className="h-8 text-xs" aria-label="Copilot model">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={SUMMARY_MODEL_ITEM}>
+                  Same as summaries{settings?.customDefaultModel ? ` (${settings.customDefaultModel})` : ''}
+                </SelectItem>
+                {modelOptions.map(m => (
+                  <SelectItem key={m} value={m}>
+                    {m}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1">
+            <span className="font-medium text-gray-700">Web search (Tavily)</span>
+            {settings?.tavilyKeyHint ? (
+              <div className="flex items-center justify-between">
+                <span>Key …{settings.tavilyKeyHint} saved</span>
+                <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => saveTavilyKey('')}>
+                  Remove
+                </Button>
+              </div>
+            ) : (
+              <>
+                <form
+                  className="flex gap-2"
+                  onSubmit={e => {
+                    e.preventDefault();
+                    if (tavilyInput.trim()) saveTavilyKey(tavilyInput);
+                  }}
+                >
+                  <Input
+                    type="password"
+                    className="h-7 text-xs"
+                    placeholder="tvly-…"
+                    autoComplete="off"
+                    aria-label="Tavily API key"
+                    value={tavilyInput}
+                    onChange={e => setTavilyInput(e.target.value)}
+                  />
+                  <Button type="submit" size="sm" className="h-7 px-2 text-xs" disabled={!tavilyInput.trim()}>
+                    Save
+                  </Button>
+                </form>
+                <p>
+                  Without a key the custom model can&apos;t search the web. Free keys at{' '}
+                  <button type="button" className="text-blue-600 hover:underline" onClick={() => openUrl('https://tavily.com')}>
+                    tavily.com
+                  </button>{' '}
+                  include 1,000 searches a month.
+                </p>
+              </>
+            )}
+          </div>
+        </>
+      )}
+
+      <div className="space-y-1">
         <div className="flex items-center justify-between">
-          <span>Folders it may read</span>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 px-2 text-xs"
-            onClick={() => changeFolders(addCopilotFolder())}
-          >
+          <span className="font-medium text-gray-700">Folders it may read</span>
+          <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => changeFolders(addCopilotFolder())}>
             <FolderPlus className="h-3.5 w-3.5" />
             Add folder
           </Button>
@@ -242,7 +393,7 @@ export function MeetingCopilot() {
         {folders.length === 0 ? (
           <p>None. Add a folder to let it search your documents and code.</p>
         ) : (
-          <ul className="space-y-1 max-h-24 overflow-y-auto">
+          <ul className="space-y-1">
             {folders.map(folder => (
               <li key={folder} className="flex items-center gap-1.5">
                 <Folder className="h-3.5 w-3.5 shrink-0" />
@@ -262,17 +413,8 @@ export function MeetingCopilot() {
             ))}
           </ul>
         )}
-        <div className="flex items-center gap-2">
-          Model
-          <Input
-            className="h-7 text-xs"
-            defaultValue={prefs.model}
-            aria-label="Copilot Gemini model"
-            onBlur={e => updatePrefs({ model: e.target.value.trim() || DEFAULT_COPILOT_MODEL })}
-          />
-        </div>
       </div>
-    </aside>
+    </div>
   );
 }
 
@@ -302,7 +444,7 @@ function CopilotEntry({ entry }: { entry: Entry }) {
               key={source.url}
               type="button"
               className="text-xs text-blue-600 hover:underline truncate max-w-full"
-              title={source.title}
+              title={source.url}
               onClick={() => openUrl(source.url)}
             >
               {source.title}

@@ -1,4 +1,4 @@
-// Meeting copilot (fork addition): Gemini + Google Search answers during a live meeting.
+// Meeting copilot (fork addition): live answers during a meeting from the web and the user's files.
 import { invoke } from '@tauri-apps/api/core';
 
 export interface CopilotSource {
@@ -17,19 +17,39 @@ export interface CopilotCard {
   sources: CopilotSource[];
   /** Files from the allowed folders that were read for this answer. */
   files: CopilotFile[];
-  /** Google's Search Suggestions widget; its terms require showing it with the answer. */
+  /** Google's Search Suggestions widget (Gemini engine); its terms require showing it with the answer. */
   suggestionsHtml: string | null;
 }
+
+/** 'gemini': Gemini + Google Search (Gemini Live keys). 'custom': the summary model's OpenAI-compatible endpoint + Tavily. */
+export type CopilotEngine = 'gemini' | 'custom';
 
 export interface CopilotPrefs {
   enabled: boolean;
   /** Research topics automatically while recording (otherwise only the Ask box). */
   auto: boolean;
+  engine: CopilotEngine;
+  /** Gemini model for the 'gemini' engine. */
   model: string;
+  /** Model for the 'custom' engine; '' means the model configured for summaries. */
+  customModel: string;
+}
+
+export interface CopilotSettings {
+  /** Last 4 characters of the saved Tavily key. */
+  tavilyKeyHint: string | null;
+  /** Model configured for summaries on the custom endpoint (null if none is set up). */
+  customDefaultModel: string | null;
 }
 
 export const DEFAULT_COPILOT_MODEL = 'gemini-3.5-flash-lite';
-const DEFAULT_PREFS: CopilotPrefs = { enabled: false, auto: true, model: DEFAULT_COPILOT_MODEL };
+const DEFAULT_PREFS: CopilotPrefs = {
+  enabled: false,
+  auto: true,
+  engine: 'gemini',
+  model: DEFAULT_COPILOT_MODEL,
+  customModel: '',
+};
 const STORAGE_KEY = 'meetingCopilot';
 
 export function loadCopilotPrefs(): CopilotPrefs {
@@ -50,11 +70,18 @@ export function saveCopilotPrefs(prefs: CopilotPrefs) {
 
 /** Resolves to null when nothing in the transcript is worth researching (auto mode only). */
 export const copilotResearch = (args: {
+  engine: CopilotEngine;
   model: string;
   transcript: string;
   covered: string[];
   question?: string;
 }) => invoke<CopilotCard | null>('copilot_research', args);
+
+export const getCopilotSettings = () => invoke<CopilotSettings>('copilot_get_settings');
+/** Saves the Tavily key; an empty string removes it. The key stays in the backend. */
+export const setTavilyKey = (apiKey: string) => invoke<CopilotSettings>('copilot_set_tavily_key', { apiKey });
+/** Models offered by the custom OpenAI-compatible endpoint used for summaries. */
+export const listCopilotModels = () => invoke<string[]>('copilot_list_models');
 
 /** Folders the copilot may search. Rust owns this list and checks every file access against it. */
 export const getCopilotFolders = () => invoke<string[]>('copilot_get_folders');
