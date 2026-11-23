@@ -19,6 +19,7 @@ import {
   CopilotEngine,
   CopilotPrefs,
   CopilotSettings,
+  AUTO_INTERVAL_CHOICES,
   DEFAULT_COPILOT_MODEL,
   addCopilotFolder,
   copilotResearch,
@@ -32,7 +33,6 @@ import {
   setTavilyKey,
 } from '@/lib/copilot';
 
-const AUTO_INTERVAL_MS = 10_000;
 const AUTO_CONTEXT_CHARS = 4_000; // roughly the last 3 minutes of speech
 const ASK_CONTEXT_CHARS = 12_000;
 /** Select item for "use the summary model" (Radix Select items cannot have an empty value). */
@@ -92,6 +92,8 @@ export function MeetingCopilot() {
   const engine: CopilotEngine = prefs?.engine ?? 'gemini';
   const model = prefs ? modelFor(prefs) : DEFAULT_COPILOT_MODEL;
   const webSearch = prefs?.webSearch ?? true;
+  // Clamped: the value comes from localStorage and could be anything.
+  const intervalMs = Math.min(120, Math.max(5, Number(prefs?.autoIntervalSeconds) || 10)) * 1000;
 
   // Auto mode: every interval, if new speech arrived, ask whether anything is worth looking up.
   useEffect(() => {
@@ -121,9 +123,9 @@ export function MeetingCopilot() {
         busy = false;
         setResearching(false);
       }
-    }, AUTO_INTERVAL_MS);
+    }, intervalMs);
     return () => clearInterval(timer);
-  }, [enabled, auto, engine, model, webSearch, isRecording]);
+  }, [enabled, auto, engine, model, webSearch, intervalMs, isRecording]);
 
   const ask = async () => {
     const q = question.trim();
@@ -296,6 +298,24 @@ function SettingsSection({
 
   return (
     <div className="space-y-3 border-t border-gray-200 pt-3 text-xs text-gray-600">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-medium text-gray-700">Check for new speech every</span>
+        <Select
+          value={String(prefs.autoIntervalSeconds)}
+          onValueChange={value => updatePrefs({ autoIntervalSeconds: Number(value) })}
+        >
+          <SelectTrigger className="h-8 w-28 text-xs" aria-label="Automatic check interval">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {AUTO_INTERVAL_CHOICES.map(seconds => (
+              <SelectItem key={seconds} value={String(seconds)}>
+                {seconds} seconds
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
       <div className="space-y-1">
         <span className="font-medium text-gray-700">Engine</span>
         <Select value={prefs.engine} onValueChange={value => updatePrefs({ engine: value as CopilotEngine })}>
