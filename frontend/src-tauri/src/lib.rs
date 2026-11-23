@@ -41,6 +41,7 @@ pub mod api;
 pub mod audio;
 pub mod config;
 pub mod console_utils;
+pub mod copilot; // Fork addition: live meeting copilot (Gemini + Google Search)
 pub mod database;
 pub mod doodle;
 pub mod notifications;
@@ -852,6 +853,7 @@ pub fn run() {
             audio::transcription::gemini_live::commands::gemini_live_move_api_key,
             audio::transcription::gemini_live::commands::gemini_live_open_log_folder,
             audio::transcription::gemini_live::commands::gemini_live_test_connection,
+            copilot::copilot_research,
             api::api_get_transcript_api_key,
             api::api_delete_meeting,
             api::api_get_meeting,
