@@ -6,10 +6,17 @@ export interface CopilotSource {
   url: string;
 }
 
+export interface CopilotFile {
+  name: string;
+  path: string;
+}
+
 export interface CopilotCard {
   topic: string;
   answer: string;
   sources: CopilotSource[];
+  /** Files from the allowed folders that were read for this answer. */
+  files: CopilotFile[];
   /** Google's Search Suggestions widget; its terms require showing it with the answer. */
   suggestionsHtml: string | null;
 }
@@ -48,3 +55,10 @@ export const copilotResearch = (args: {
   covered: string[];
   question?: string;
 }) => invoke<CopilotCard | null>('copilot_research', args);
+
+/** Folders the copilot may search. Rust owns this list and checks every file access against it. */
+export const getCopilotFolders = () => invoke<string[]>('copilot_get_folders');
+/** Opens a folder picker; resolves to the updated list (unchanged if cancelled). */
+export const addCopilotFolder = () => invoke<string[]>('copilot_add_folder');
+export const removeCopilotFolder = (folder: string) => invoke<string[]>('copilot_remove_folder', { folder });
+export const openCopilotFile = (path: string) => invoke<void>('copilot_open_file', { path });

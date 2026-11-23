@@ -6,7 +6,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import ReactMarkdown from 'react-markdown';
-import { Loader2, Send, Sparkles, X } from 'lucide-react';
+import { FileText, Folder, FolderPlus, Loader2, Send, Sparkles, X } from 'lucide-react';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { Button } from '@/components/ui/button';
@@ -17,8 +17,12 @@ import {
   CopilotCard,
   CopilotPrefs,
   DEFAULT_COPILOT_MODEL,
+  addCopilotFolder,
   copilotResearch,
+  getCopilotFolders,
   loadCopilotPrefs,
+  openCopilotFile,
+  removeCopilotFolder,
   saveCopilotPrefs,
 } from '@/lib/copilot';
 
@@ -43,6 +47,7 @@ export function MeetingCopilot() {
   const [asking, setAsking] = useState(false);
   const [question, setQuestion] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [folders, setFolders] = useState<string[]>([]);
 
   const transcriptsRef = useRef(transcripts);
   transcriptsRef.current = transcripts;
@@ -76,6 +81,18 @@ export function MeetingCopilot() {
   const enabled = prefs?.enabled ?? false;
   const auto = prefs?.auto ?? false;
   const model = prefs?.model || DEFAULT_COPILOT_MODEL;
+
+  useEffect(() => {
+    if (enabled) getCopilotFolders().then(setFolders).catch(e => setError(String(e)));
+  }, [enabled]);
+
+  const changeFolders = (change: Promise<string[]>) =>
+    change
+      .then(list => {
+        setFolders(list);
+        setError(null);
+      })
+      .catch(e => setError(String(e)));
 
   // Auto mode: every interval, if new speech arrived, ask Gemini whether anything is worth looking up.
   useEffect(() => {
@@ -190,7 +207,8 @@ export function MeetingCopilot() {
           </Button>
         </form>
         <p className="text-xs text-gray-500">
-          Sends the recent transcript to Google Gemini with web search, using your Gemini API keys.
+          Sends the recent transcript, and text from any allowed files it reads, to Google Gemini
+          using your Gemini API keys.
         </p>
         {error && <p className="text-xs text-red-600 break-words">{error}</p>}
       </div>
@@ -208,14 +226,51 @@ export function MeetingCopilot() {
         ))}
       </div>
 
-      <div className="border-t border-gray-200 p-3 flex items-center gap-2 text-xs text-gray-500">
-        Model
-        <Input
-          className="h-7 text-xs"
-          defaultValue={prefs.model}
-          aria-label="Copilot Gemini model"
-          onBlur={e => updatePrefs({ model: e.target.value.trim() || DEFAULT_COPILOT_MODEL })}
-        />
+      <div className="border-t border-gray-200 p-3 space-y-2 text-xs text-gray-500">
+        <div className="flex items-center justify-between">
+          <span>Folders it may read</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            onClick={() => changeFolders(addCopilotFolder())}
+          >
+            <FolderPlus className="h-3.5 w-3.5" />
+            Add folder
+          </Button>
+        </div>
+        {folders.length === 0 ? (
+          <p>None. Add a folder to let it search your documents and code.</p>
+        ) : (
+          <ul className="space-y-1 max-h-24 overflow-y-auto">
+            {folders.map(folder => (
+              <li key={folder} className="flex items-center gap-1.5">
+                <Folder className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate flex-1" title={folder}>
+                  {folder}
+                </span>
+                <button
+                  type="button"
+                  className="shrink-0 text-gray-400 hover:text-gray-700"
+                  title={`Stop reading ${folder}`}
+                  aria-label={`Remove folder ${folder}`}
+                  onClick={() => changeFolders(removeCopilotFolder(folder))}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="flex items-center gap-2">
+          Model
+          <Input
+            className="h-7 text-xs"
+            defaultValue={prefs.model}
+            aria-label="Copilot Gemini model"
+            onBlur={e => updatePrefs({ model: e.target.value.trim() || DEFAULT_COPILOT_MODEL })}
+          />
+        </div>
       </div>
     </aside>
   );
@@ -251,6 +306,22 @@ function CopilotEntry({ entry }: { entry: Entry }) {
               onClick={() => openUrl(source.url)}
             >
               {source.title}
+            </button>
+          ))}
+        </div>
+      )}
+      {entry.files.length > 0 && (
+        <div className="flex flex-wrap gap-x-3 gap-y-1">
+          {entry.files.map(file => (
+            <button
+              key={file.path}
+              type="button"
+              className="flex items-center gap-1 text-xs text-gray-700 hover:underline max-w-full"
+              title={file.path}
+              onClick={() => openCopilotFile(file.path).catch(err => console.error('Failed to open file:', err))}
+            >
+              <FileText className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate">{file.name}</span>
             </button>
           ))}
         </div>
