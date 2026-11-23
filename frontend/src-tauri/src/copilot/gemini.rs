@@ -21,23 +21,31 @@ pub fn valid_model(model: &str) -> bool {
     answer::valid_model(model) && !model.contains('/') && !model.contains(':')
 }
 
-pub fn request_body(system: &str, contents: &[Value], with_files: bool) -> Value {
+pub fn request_body(system: &str, contents: &[Value], web_search: bool, with_files: bool) -> Value {
     let mut body = json!({
         "systemInstruction": { "parts": [{ "text": system }] },
-        "contents": contents,
-        "tools": [{ "google_search": {} }]
+        "contents": contents
     });
+    let mut tools = Vec::new();
     if with_files {
         let declarations: Vec<Value> = answer::file_tool_specs()
             .into_iter()
             .map(|(name, description, parameters)| json!({ "name": name, "description": description, "parameters": parameters }))
             .collect();
-        body["tools"] = json!([{ "google_search": {} }, { "functionDeclarations": declarations }]);
+        tools.push(json!({ "functionDeclarations": declarations }));
+    }
+    if web_search {
+        tools.push(json!({ "google_search": {} }));
+    }
+    if web_search && with_files {
         // Required when Google Search and custom functions are combined in one request.
         body["toolConfig"] = json!({
             "includeServerSideToolInvocations": true,
             "functionCallingConfig": { "mode": "VALIDATED" }
         });
+    }
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
     }
     body
 }
@@ -116,15 +124,21 @@ mod tests {
     }
 
     #[test]
-    fn request_body_adds_file_tools_only_with_folders() {
+    fn request_body_includes_only_enabled_tools() {
         let contents = vec![json!({ "role": "user", "parts": [{ "text": "hi" }] })];
-        let web = request_body("sys", &contents, false);
+        let web = request_body("sys", &contents, true, false);
         assert_eq!(web["tools"], json!([{ "google_search": {} }]));
         assert!(web.get("toolConfig").is_none());
-        let both = request_body("sys", &contents, true);
-        assert_eq!(both["tools"][1]["functionDeclarations"][0]["name"], "search_files");
+        let both = request_body("sys", &contents, true, true);
+        assert_eq!(both["tools"][0]["functionDeclarations"][0]["name"], "search_files");
+        assert_eq!(both["tools"][1], json!({ "google_search": {} }));
         assert_eq!(both["toolConfig"]["includeServerSideToolInvocations"], true);
         assert_eq!(both["systemInstruction"]["parts"][0]["text"], "sys");
+        let files_only = request_body("sys", &contents, false, true);
+        assert_eq!(files_only["tools"].as_array().unwrap().len(), 1);
+        assert!(files_only.get("toolConfig").is_none());
+        let none = request_body("sys", &contents, false, false);
+        assert!(none.get("tools").is_none());
     }
 
     #[test]

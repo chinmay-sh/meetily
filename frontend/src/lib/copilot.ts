@@ -28,6 +28,8 @@ export interface CopilotPrefs {
   enabled: boolean;
   /** Research topics automatically while recording (otherwise only the Ask box). */
   auto: boolean;
+  /** Let the model search the web (Google Search or Tavily). The Tavily key stays saved either way. */
+  webSearch: boolean;
   engine: CopilotEngine;
   /** Gemini model for the 'gemini' engine. */
   model: string;
@@ -46,6 +48,7 @@ export const DEFAULT_COPILOT_MODEL = 'gemini-3.5-flash-lite';
 const DEFAULT_PREFS: CopilotPrefs = {
   enabled: false,
   auto: true,
+  webSearch: true,
   engine: 'gemini',
   model: DEFAULT_COPILOT_MODEL,
   customModel: '',
@@ -72,6 +75,7 @@ export function saveCopilotPrefs(prefs: CopilotPrefs) {
 export const copilotResearch = (args: {
   engine: CopilotEngine;
   model: string;
+  webSearch: boolean;
   transcript: string;
   covered: string[];
   question?: string;

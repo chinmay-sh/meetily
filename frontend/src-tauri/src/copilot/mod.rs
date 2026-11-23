@@ -130,12 +130,14 @@ pub async fn copilot_list_models(state: tauri::State<'_, AppState>) -> Result<Ve
 /// Research the latest meeting context with the chosen `engine` ("gemini" or "custom").
 /// With `question`, always answers it; without, returns `None` when nothing in the
 /// transcript is worth looking up. An empty `model` means the engine's default.
+/// `web_search` off keeps the model to its own knowledge and the allowed folders.
 #[tauri::command]
 pub async fn copilot_research<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     engine: String,
     model: String,
+    web_search: bool,
     transcript: String,
     covered: Vec<String>,
     question: Option<String>,
@@ -153,11 +155,12 @@ pub async fn copilot_research<R: Runtime>(
         if !answer::valid_model(model) {
             return Err("Invalid model name.".into());
         }
-        let tavily_key = load_settings(&app)?.tavily_api_key;
+        // The saved key stays saved; turning web search off just doesn't use it.
+        let tavily_key = load_settings(&app)?.tavily_api_key.filter(|_| web_search);
         let endpoint = custom::Endpoint { base_url: &config.endpoint, api_key: config.api_key.as_deref(), model };
         custom::research(&client, &endpoint, tavily_key.as_deref(), &folders, &roots, prompt).await?
     } else {
-        research_gemini(&client, pool, model.trim(), &folders, &roots, prompt).await?
+        research_gemini(&client, pool, model.trim(), web_search, &folders, &roots, prompt).await?
     };
 
     if card.is_none() && question.is_some() {
@@ -208,6 +211,7 @@ async fn research_gemini(
     client: &reqwest::Client,
     pool: &sqlx::SqlitePool,
     model: &str,
+    web_search: bool,
     folders: &[String],
     roots: &[PathBuf],
     prompt: String,
@@ -221,14 +225,14 @@ async fn research_gemini(
     }
     let with_files = !roots.is_empty();
     let prompt_folders: &[String] = if with_files { folders } else { &[] };
-    let system = answer::system_prompt(Web::GoogleSearch, prompt_folders);
+    let system = answer::system_prompt(if web_search { Web::GoogleSearch } else { Web::None }, prompt_folders);
     let mut contents = vec![json!({ "role": "user", "parts": [{ "text": prompt }] })];
     let url = format!("{}/{}:generateContent", gemini::ENDPOINT, model);
     let mut key_index = 0;
     let mut files_read: Vec<CopilotFile> = Vec::new();
 
     for _ in 0..GEMINI_MAX_ROUNDS {
-        let body = gemini::request_body(&system, &contents, with_files);
+        let body = gemini::request_body(&system, &contents, web_search, with_files);
         let (response, used) = post_gemini(client, &url, &keys, key_index, &body).await?;
         key_index = used;
         let candidate = response["candidates"].get(0).cloned().unwrap_or(Value::Null);

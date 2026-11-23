@@ -32,11 +32,12 @@ pub fn endpoint_url(base_url: &str, path: &str) -> String {
 
 pub fn tools(web_search: bool, files: bool) -> Vec<Value> {
     let mut specs = Vec::new();
-    if web_search {
-        specs.push(web::tool_spec());
-    }
+    // Files first: the prompt makes them the primary source.
     if files {
         specs.extend(answer::file_tool_specs());
+    }
+    if web_search {
+        specs.push(web::tool_spec());
     }
     specs
         .into_iter()
@@ -217,7 +218,7 @@ mod tests {
         assert!(tools(false, false).is_empty());
         let names = |t: Vec<Value>| t.iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         assert_eq!(names(tools(true, false)), vec!["web_search"]);
-        assert_eq!(names(tools(true, true)), vec!["web_search", "search_files", "read_file"]);
+        assert_eq!(names(tools(true, true)), vec!["search_files", "read_file", "web_search"]);
         assert_eq!(tools(false, true)[0]["type"], "function");
 
         let body = request_body("m", &[json!({ "role": "user", "content": "hi" })], &[]);

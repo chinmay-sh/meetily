@@ -91,6 +91,7 @@ export function MeetingCopilot() {
   const auto = prefs?.auto ?? false;
   const engine: CopilotEngine = prefs?.engine ?? 'gemini';
   const model = prefs ? modelFor(prefs) : DEFAULT_COPILOT_MODEL;
+  const webSearch = prefs?.webSearch ?? true;
 
   // Auto mode: every interval, if new speech arrived, ask whether anything is worth looking up.
   useEffect(() => {
@@ -106,6 +107,7 @@ export function MeetingCopilot() {
         const card = await copilotResearch({
           engine,
           model,
+          webSearch,
           transcript: recentText(transcriptsRef.current, AUTO_CONTEXT_CHARS),
           covered: entriesRef.current.map(e => e.topic).filter(Boolean),
         });
@@ -121,7 +123,7 @@ export function MeetingCopilot() {
       }
     }, AUTO_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [enabled, auto, engine, model, isRecording]);
+  }, [enabled, auto, engine, model, webSearch, isRecording]);
 
   const ask = async () => {
     const q = question.trim();
@@ -132,6 +134,7 @@ export function MeetingCopilot() {
       const card = await copilotResearch({
         engine,
         model,
+        webSearch,
         transcript: recentText(transcriptsRef.current, ASK_CONTEXT_CHARS),
         covered: [],
         question: q,
@@ -200,6 +203,10 @@ export function MeetingCopilot() {
           Research topics automatically while recording
           <Switch checked={prefs.auto} onCheckedChange={value => updatePrefs({ auto: value })} />
         </label>
+        <label className="flex items-center justify-between gap-3 text-sm text-gray-700">
+          Search the web
+          <Switch checked={prefs.webSearch} onCheckedChange={value => updatePrefs({ webSearch: value })} />
+        </label>
         <form
           className="flex gap-2"
           onSubmit={e => {
@@ -220,7 +227,7 @@ export function MeetingCopilot() {
         </form>
         <p className="text-xs text-gray-500">
           {prefs.engine === 'custom'
-            ? 'Sends the recent transcript, and text from any allowed files it reads, to your custom model endpoint, and search queries to Tavily.'
+            ? `Sends the recent transcript, and text from any allowed files it reads, to your custom model endpoint${prefs.webSearch ? ', and search queries to Tavily' : ''}.`
             : 'Sends the recent transcript, and text from any allowed files it reads, to Google Gemini using your Gemini API keys.'}
         </p>
         {error && <p className="text-xs text-red-600 break-words">{error}</p>}

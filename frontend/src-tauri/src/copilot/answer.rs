@@ -26,12 +26,13 @@ something new about them was asked. If nothing qualifies, reply with exactly: NO
 
 ";
 
-const WEB_GOOGLE: &str = "Search the web before answering questions about public facts.
+const WEB_GOOGLE: &str = "Search the web (Google Search) for public facts and recent news before \
+answering them.
 
 ";
 
-const WEB_TOOL: &str = "Use the web_search tool for public facts and recent news: search before \
-answering, and try a different query if the results are poor.
+const WEB_TOOL: &str = "Search the web with the web_search tool for public facts and recent news \
+before answering them, and try a different query if the results are poor.
 
 ";
 
@@ -44,13 +45,19 @@ const NO_FILES: &str = "Ignore the participants' own internal work, which you ca
 
 ";
 
-const FILES: &str = "For the user's own work (their documents, code, clients, projects, earlier \
-decisions), use the search_files and read_file tools, which can only see these folders:
+const FILES: &str = "The user shared their own documents and code in these folders:
 {folders}
-In automatic mode, only search files when someone refers to a document, file, report, code or earlier \
-decision, or asks something the user's files can answer. search_files matches keywords in file names \
-and contents, so try different keywords if the first search finds nothing. Read the most relevant \
-files before answering and name the files you used.
+These files are your FIRST source. Whenever the meeting or the question touches a company, client, \
+person, project, product, document, number or decision, call search_files before anything else. It \
+matches keywords in file names and contents, so try two or three keyword sets (names, synonyms, \
+abbreviations) before concluding the files have nothing. Read the most relevant files with read_file, \
+base the answer on them, and name the files you used.
+
+";
+
+const FILES_THEN_WEB: &str = "Only after checking the files, search the web for what they do not \
+cover, such as recent public news, and say which facts came from the web. If the files already \
+answer it, or it is about the user's internal work, do not search the web.
 
 ";
 
@@ -129,17 +136,20 @@ fn tail(text: &str, max_chars: usize) -> &str {
 
 pub fn system_prompt(web: Web, folders: &[String]) -> String {
     let mut prompt = String::from(ROLE);
-    prompt.push_str(match web {
-        Web::GoogleSearch => WEB_GOOGLE,
-        Web::Tool => WEB_TOOL,
-        Web::None => WEB_NONE,
-    });
     if folders.is_empty() {
         prompt.push_str(NO_FILES);
     } else {
         let list: Vec<String> = folders.iter().map(|f| format!("- {}", f)).collect();
         prompt.push_str(&FILES.replace("{folders}", &list.join("\n")));
+        if web != Web::None {
+            prompt.push_str(FILES_THEN_WEB);
+        }
     }
+    prompt.push_str(match web {
+        Web::GoogleSearch => WEB_GOOGLE,
+        Web::Tool => WEB_TOOL,
+        Web::None => WEB_NONE,
+    });
     prompt.push_str(FORMAT);
     prompt
 }
@@ -272,6 +282,11 @@ mod tests {
         assert!(with_files.contains("web_search tool"));
         assert!(with_files.contains("folders:\n- C:\\Docs\n"));
         assert!(!with_files.contains("{folders}"));
+        // Files come first; the web only for what they do not cover.
+        assert!(with_files.find("FIRST source").unwrap() < with_files.find("Only after checking the files").unwrap());
+        assert!(with_files.find("Only after checking the files").unwrap() < with_files.find("web_search tool").unwrap());
+        let files_only = system_prompt(Web::None, &["C:\\Docs".to_string()]);
+        assert!(files_only.contains("no web access") && !files_only.contains("Only after checking the files"));
         assert!(system_prompt(Web::None, &[]).contains("no web access"));
     }
 
