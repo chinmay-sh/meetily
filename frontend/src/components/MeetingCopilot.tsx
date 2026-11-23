@@ -32,7 +32,7 @@ import {
   setTavilyKey,
 } from '@/lib/copilot';
 
-const AUTO_INTERVAL_MS = 20_000;
+const AUTO_INTERVAL_MS = 10_000;
 const AUTO_CONTEXT_CHARS = 4_000; // roughly the last 3 minutes of speech
 const ASK_CONTEXT_CHARS = 12_000;
 /** Select item for "use the summary model" (Radix Select items cannot have an empty value). */
